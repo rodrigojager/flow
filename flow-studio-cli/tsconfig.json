@@ -1,0 +1,26 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "baseUrl": ".",
+    "paths": {
+      "@cybervinci/flow-shared": [
+        "../flow-studio-shared/src",
+        "../flow-studio-shared/lib"
+      ]
+    },
+    "rootDir": "src",
+    "outDir": "lib",
+    "esModuleInterop": true,
+    "module": "commonjs",
+    "resolveJsonModule": true
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "../flow-studio-shared"
+    }
+  ]
+}

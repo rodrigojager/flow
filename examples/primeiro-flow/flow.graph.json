@@ -1,0 +1,625 @@
+{
+  "version": "flow-studio/v2",
+  "id": "flow-1786346514842",
+  "name": "Meu primeiro Flow",
+  "description": "Fluxo multiagente com roteamento, paralelo, gate, loop seguro e revisão reutilizável.",
+  "start": "entrada",
+  "budget": {
+    "maxSteps": 500,
+    "maxDurationMs": 1800000,
+    "maxCostUsd": 10,
+    "maxParallelism": 4
+  },
+  "permissions": {
+    "allow": [
+      "runner:invoke",
+      "tool:read"
+    ],
+    "requireApproval": [
+      "tool:command",
+      "tool:write",
+      "tool:network"
+    ]
+  },
+  "state": {
+    "strictWrites": false,
+    "namespaces": {
+      "flow": {
+        "description": "Estado principal",
+        "reducer": {
+          "kind": "merge"
+        }
+      },
+      "branches": {
+        "description": "Resultados paralelos",
+        "reducer": {
+          "kind": "merge"
+        }
+      },
+      "review": {
+        "description": "Revisão independente",
+        "reducer": {
+          "kind": "merge"
+        }
+      }
+    }
+  },
+  "modelProfiles": [
+    {
+      "id": "cybervinci/default",
+      "name": "CyberVinci · configuração atual",
+      "providerId": "cybervinci",
+      "runnerId": "cybervinci",
+      "modelId": "default",
+      "description": "Reutiliza o login, o modelo padrão e as sessões do CyberVinci CLI.",
+      "tags": [
+        "local",
+        "coding",
+        "reasoning",
+        "tools"
+      ],
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "sessions",
+        "subagents"
+      ],
+      "reasonDefault": "high"
+    },
+    {
+      "id": "opencode/gpt-5.5",
+      "name": "OpenCode GPT-5.5",
+      "providerId": "opencode",
+      "runnerId": "opencode",
+      "modelId": "opencode/gpt-5.5",
+      "description": "Perfil de coordenação e raciocínio profundo.",
+      "tags": [
+        "coding",
+        "reasoning",
+        "default"
+      ],
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "sessions",
+        "subagents"
+      ],
+      "reasonDefault": "high"
+    },
+    {
+      "id": "codex/gpt-5.5-codex",
+      "name": "Codex GPT-5.5",
+      "providerId": "codex",
+      "runnerId": "codex",
+      "modelId": "gpt-5.5-codex",
+      "description": "Perfil para execução de engenharia via Codex CLI.",
+      "tags": [
+        "coding",
+        "tools",
+        "reasoning"
+      ],
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "streaming",
+        "sessions",
+        "subagents"
+      ],
+      "reasonDefault": "high"
+    },
+    {
+      "id": "opencode-go/minimax-m3",
+      "name": "OpenCode Go MiniMax M3",
+      "providerId": "opencode-go",
+      "runnerId": "opencode",
+      "modelId": "opencode-go/minimax-m3",
+      "description": "Perfil rápido e econômico para execução principal.",
+      "tags": [
+        "fast",
+        "budget"
+      ],
+      "capabilities": [
+        "text",
+        "tools",
+        "structured-output"
+      ],
+      "costPerMTokPrompt": 0.5,
+      "costPerMTokOutput": 0.9,
+      "reasonDefault": "medium"
+    },
+    {
+      "id": "opencode-go/deepseek-v4-flash",
+      "name": "OpenCode Go DeepSeek Flash",
+      "providerId": "opencode-go",
+      "runnerId": "opencode",
+      "modelId": "opencode-go/deepseek-v4-flash",
+      "description": "Perfil barato para triagem, transformação e classificação.",
+      "tags": [
+        "fast",
+        "cheap"
+      ],
+      "capabilities": [
+        "text",
+        "structured-output"
+      ],
+      "costPerMTokPrompt": 0.18,
+      "costPerMTokOutput": 0.6,
+      "reasonDefault": "low"
+    }
+  ],
+  "subgraphs": {
+    "review": {
+      "version": "flow-studio/v2",
+      "id": "subgraph-revisao",
+      "name": "Revisão independente",
+      "start": "revisor",
+      "nodes": [
+        {
+          "id": "revisor",
+          "type": "agent",
+          "label": "Revisar evidências",
+          "prompt": "Revise o resultado em {{resultado}}. Retorne approved, blockers e summary.",
+          "provider": {
+            "providerId": "codex",
+            "reasoningEffort": "high",
+            "fallbacks": [
+              {
+                "providerId": "cybervinci",
+                "reasoningEffort": "high"
+              },
+              {
+                "providerId": "opencode",
+                "reasoningEffort": "high"
+              }
+            ]
+          },
+          "outputs": {
+            "approved": "review.approved",
+            "blockers": "review.blockers",
+            "summary": "review.summary"
+          },
+          "next": "fim-revisao"
+        },
+        {
+          "id": "fim-revisao",
+          "type": "end",
+          "label": "Fim da revisão"
+        }
+      ],
+      "edges": [
+        {
+          "id": "review-end",
+          "from": "revisor",
+          "to": "fim-revisao"
+        }
+      ]
+    }
+  },
+  "runners": [
+    {
+      "id": "cybervinci",
+      "name": "CyberVinci",
+      "kind": "cybervinci",
+      "providerId": "cybervinci",
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "sessions",
+        "subagents"
+      ]
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "kind": "opencode",
+      "providerId": "opencode",
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "sessions",
+        "subagents"
+      ]
+    },
+    {
+      "id": "codex",
+      "name": "Codex CLI",
+      "kind": "codex",
+      "providerId": "codex",
+      "capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "files",
+        "structured-output",
+        "streaming",
+        "sessions",
+        "subagents"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "entrada",
+      "type": "input",
+      "label": "Pedido",
+      "next": "planejador",
+      "outputs": {
+        "prompt": "flow.request"
+      },
+      "position": {
+        "x": 40,
+        "y": 100
+      }
+    },
+    {
+      "id": "planejador",
+      "type": "agent",
+      "label": "Planejar",
+      "prompt": "Crie um plano verificável para: {{flow.request}}",
+      "provider": {
+        "runnerId": "codex",
+        "providerId": "codex",
+        "reasoningEffort": "high",
+        "fallbacks": [
+          {
+            "runnerId": "cybervinci",
+            "providerId": "cybervinci",
+            "reasoningEffort": "high"
+          },
+          {
+            "runnerId": "opencode",
+            "providerId": "opencode",
+            "reasoningEffort": "high"
+          }
+        ]
+      },
+      "outputs": {
+        "plan": "flow.plan",
+        "risk": "flow.risk"
+      },
+      "next": "rotear-risco",
+      "position": {
+        "x": 290,
+        "y": 100
+      }
+    },
+    {
+      "id": "rotear-risco",
+      "type": "router",
+      "label": "Risco aceitável?",
+      "condition": "Boolean(context.flow?.plan) && context.flow?.risk !== \"high\"",
+      "position": {
+        "x": 540,
+        "y": 100
+      }
+    },
+    {
+      "id": "gate-risco",
+      "type": "gate",
+      "label": "Aprovar risco",
+      "gate": {
+        "kind": "human",
+        "prompt": "O plano de risco alto pode prosseguir?",
+        "requireEvidence": true
+      },
+      "gateDecisions": [
+        {
+          "id": "aprovar",
+          "label": "Aprovar",
+          "decision": "continue",
+          "toNodeId": "executar-paralelo"
+        },
+        {
+          "id": "aguardar",
+          "label": "Aguardar",
+          "decision": "wait"
+        },
+        {
+          "id": "rejeitar",
+          "label": "Rejeitar",
+          "decision": "fail"
+        }
+      ],
+      "position": {
+        "x": 540,
+        "y": 300
+      }
+    },
+    {
+      "id": "executar-paralelo",
+      "type": "fork",
+      "label": "Executar em paralelo",
+      "fork": {
+        "branches": [
+          "executor",
+          "pesquisador"
+        ],
+        "join": "consolidar",
+        "maxConcurrency": 2
+      },
+      "position": {
+        "x": 790,
+        "y": 100
+      }
+    },
+    {
+      "id": "executor",
+      "type": "agent",
+      "label": "Executar",
+      "prompt": "Execute o plano {{flow.plan}} e devolva resultado e evidências.",
+      "provider": {
+        "runnerId": "codex",
+        "providerId": "codex",
+        "reasoningEffort": "high",
+        "fallbacks": [
+          {
+            "runnerId": "cybervinci",
+            "providerId": "cybervinci",
+            "reasoningEffort": "high"
+          },
+          {
+            "runnerId": "opencode",
+            "providerId": "opencode",
+            "reasoningEffort": "high"
+          }
+        ]
+      },
+      "outputs": {
+        "result": "branches.execution",
+        "evidence": "branches.executionEvidence"
+      },
+      "next": "consolidar",
+      "position": {
+        "x": 1040,
+        "y": 20
+      }
+    },
+    {
+      "id": "pesquisador",
+      "type": "agent",
+      "label": "Pesquisar",
+      "prompt": "Pesquise riscos e alternativas para {{flow.plan}}.",
+      "provider": {
+        "runnerId": "codex",
+        "providerId": "codex",
+        "reasoningEffort": "low",
+        "fallbacks": [
+          {
+            "runnerId": "cybervinci",
+            "providerId": "cybervinci",
+            "reasoningEffort": "low"
+          },
+          {
+            "runnerId": "opencode",
+            "providerId": "opencode",
+            "reasoningEffort": "low"
+          }
+        ]
+      },
+      "outputs": {
+        "result": "branches.research"
+      },
+      "next": "consolidar",
+      "position": {
+        "x": 1040,
+        "y": 180
+      }
+    },
+    {
+      "id": "consolidar",
+      "type": "join",
+      "label": "Consolidar",
+      "join": {
+        "strategy": "all",
+        "reducer": "branches"
+      },
+      "next": "revisar",
+      "position": {
+        "x": 1290,
+        "y": 100
+      }
+    },
+    {
+      "id": "revisar",
+      "type": "subgraph",
+      "label": "Revisão independente",
+      "subgraph": {
+        "graphId": "review",
+        "input": {
+          "branches.execution": "resultado"
+        },
+        "output": {
+          "review.approved": "review.approved",
+          "review.blockers": "review.blockers"
+        }
+      },
+      "next": "corrigir",
+      "position": {
+        "x": 1540,
+        "y": 100
+      }
+    },
+    {
+      "id": "corrigir",
+      "type": "loop",
+      "label": "Corrigir blockers",
+      "loop": {
+        "bodyStart": "correcao",
+        "condition": "context.review?.approved === false",
+        "maxIterations": 3,
+        "breakWhen": "context.review?.approved === true"
+      },
+      "next": "relatorio",
+      "position": {
+        "x": 1790,
+        "y": 100
+      }
+    },
+    {
+      "id": "correcao",
+      "type": "agent",
+      "label": "Aplicar correções",
+      "prompt": "Corrija os blockers: {{review.blockers}}",
+      "provider": {
+        "runnerId": "codex",
+        "providerId": "codex",
+        "reasoningEffort": "high",
+        "fallbacks": [
+          {
+            "runnerId": "cybervinci",
+            "providerId": "cybervinci",
+            "reasoningEffort": "high"
+          },
+          {
+            "runnerId": "opencode",
+            "providerId": "opencode",
+            "reasoningEffort": "high"
+          }
+        ]
+      },
+      "outputs": {
+        "result": "branches.execution",
+        "approved": "review.approved"
+      },
+      "next": "corrigir",
+      "position": {
+        "x": 1790,
+        "y": 300
+      }
+    },
+    {
+      "id": "relatorio",
+      "type": "report",
+      "label": "Relatório final",
+      "prompt": "Produza um relatório curto com resultado, evidências e revisão.",
+      "provider": {
+        "runnerId": "codex",
+        "providerId": "codex",
+        "reasoningEffort": "medium",
+        "fallbacks": [
+          {
+            "runnerId": "cybervinci",
+            "providerId": "cybervinci",
+            "reasoningEffort": "medium"
+          },
+          {
+            "runnerId": "opencode",
+            "providerId": "opencode",
+            "reasoningEffort": "medium"
+          }
+        ]
+      },
+      "outputs": {
+        "report": "flow.report"
+      },
+      "next": "final",
+      "position": {
+        "x": 2040,
+        "y": 100
+      }
+    },
+    {
+      "id": "final",
+      "type": "end",
+      "label": "Concluído",
+      "position": {
+        "x": 2290,
+        "y": 100
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "entrada-planejador",
+      "from": "entrada",
+      "to": "planejador"
+    },
+    {
+      "id": "planejador-router",
+      "from": "planejador",
+      "to": "rotear-risco"
+    },
+    {
+      "id": "risco-ok",
+      "from": "rotear-risco",
+      "to": "executar-paralelo",
+      "guard": "condition === true",
+      "label": "sim",
+      "priority": 0
+    },
+    {
+      "id": "risco-gate",
+      "from": "rotear-risco",
+      "to": "gate-risco",
+      "guard": "condition === false",
+      "label": "revisar",
+      "priority": 1
+    },
+    {
+      "id": "gate-fork",
+      "from": "gate-risco",
+      "to": "executar-paralelo"
+    },
+    {
+      "id": "fork-executor",
+      "from": "executar-paralelo",
+      "to": "executor"
+    },
+    {
+      "id": "fork-pesquisa",
+      "from": "executar-paralelo",
+      "to": "pesquisador"
+    },
+    {
+      "id": "executor-join",
+      "from": "executor",
+      "to": "consolidar"
+    },
+    {
+      "id": "pesquisa-join",
+      "from": "pesquisador",
+      "to": "consolidar"
+    },
+    {
+      "id": "join-review",
+      "from": "consolidar",
+      "to": "revisar"
+    },
+    {
+      "id": "review-loop",
+      "from": "revisar",
+      "to": "corrigir"
+    },
+    {
+      "id": "correcao-loop",
+      "from": "correcao",
+      "to": "corrigir",
+      "outcome": "back"
+    },
+    {
+      "id": "loop-report",
+      "from": "corrigir",
+      "to": "relatorio"
+    },
+    {
+      "id": "report-end",
+      "from": "relatorio",
+      "to": "final"
+    }
+  ]
+}

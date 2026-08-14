@@ -1,0 +1,46 @@
+{
+  "name": "@cybervinci/flow-plugin",
+  "version": "1.74.0",
+  "description": "CyberVinci and OpenCode plugin for Flow graph operations and CLI automation",
+  "license": "EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0",
+  "type": "module",
+  "bin": {
+    "flow-controller": "lib/bin.js"
+  },
+  "main": "lib/opencode-plugin.js",
+  "types": "lib/opencode-plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/opencode-plugin.d.ts",
+      "import": "./lib/opencode-plugin.js"
+    },
+    "./controller": {
+      "types": "./lib/controller.d.ts",
+      "import": "./lib/controller.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -b tsconfig.json --force",
+    "compile": "npm run build",
+    "test": "npm run build && node --test test/*.test.js",
+    "watch": "tsc -p tsconfig.json --watch --preserveWatchOutput"
+  },
+  "dependencies": {
+    "@cybervinci/flow": "1.74.0",
+    "@cybervinci/flow-shared": "1.74.0",
+    "@opencode-ai/plugin": "1.18.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

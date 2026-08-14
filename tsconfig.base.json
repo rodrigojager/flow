@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noImplicitAny": true,
+    "noImplicitOverride": true,
+    "noEmitOnError": true,
+    "noImplicitThis": true,
+    "noUnusedLocals": true,
+    "strictNullChecks": true,
+    "importHelpers": true,
+    "downlevelIteration": true,
+    "resolveJsonModule": true,
+    "useDefineForClassFields": false,
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "target": "ES2023",
+    "jsx": "react",
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.AsyncIterable"
+    ],
+    "sourceMap": true
+  }
+}

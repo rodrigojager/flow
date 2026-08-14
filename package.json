@@ -1,0 +1,15 @@
+{
+  "name": "@cybervinci/flow-workspace",
+  "version": "1.74.0",
+  "private": true,
+  "workspaces": [
+    "flow-studio-shared",
+    "flow-studio-cli",
+    "flow-studio-opencode-controller"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @cybervinci/flow-shared && npm run build --workspace @cybervinci/flow && npm run build --workspace @cybervinci/flow-plugin",
+    "test": "npm test --workspace @cybervinci/flow-shared && npm test --workspace @cybervinci/flow && npm test --workspace @cybervinci/flow-plugin",
+    "check": "npm run test"
+  }
+}
