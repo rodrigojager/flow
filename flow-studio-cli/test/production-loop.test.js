@@ -8,7 +8,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
-const { runProductionQueue } = require('../lib/production-loop');
+const { runProductionQueue, retryProductionPreparation } = require('../lib/production-loop');
 const { FlowStudioFileRunStore } = require('../lib/run-store');
 const { validateFlowStudioGraph } = require('@cybervinci/flow-shared');
 
@@ -666,3 +666,315 @@ test('correction respects session budget and preserves unresolved judge IDs unti
     assert.equal(accepted.current, 1); assert.equal(accepted.approvals[0].revision, 3);
     assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1', 'produce:a:2', 'produce:a:3']);
 });
+
+async function preparationRetryFixture(t) {
+    const f = await fixture(t), prepare = f.options.adapters.prepare;
+    const blocked = { status: 'BLOCKED', reasons: ['Synthetic preparation protocol needs correction.'] };
+    f.options.adapters.prepare = async args => { await prepare(args); return blocked; };
+    const before = await runProductionQueue(f.options);
+    const retryOptions = { stateDir: f.options.stateDir, expectedRunId: before.pending.runId,
+        expectedCatalogHash: before.catalogHash, reason: 'Host corrected the synthetic preparation protocol.' };
+    return { ...f, prepare, before, retryOptions, queuePath: path.join(f.options.stateDir, 'queue.json'),
+        runPath: f.store.pathFor(before.pending.runId) };
+}
+
+async function assertPreparationRetryRejected(f, overrides = {}, expectedError) {
+    const beforeQueue = await fs.readFile(f.queuePath, 'utf8');
+    const beforeRun = await fs.readFile(f.runPath, 'utf8').catch(error => { if (error.code !== 'ENOENT') throw error; });
+    const calls = [...f.calls];
+    await assert.rejects(retryProductionPreparation({ ...f.retryOptions, ...overrides }), expectedError);
+    assert.equal(await fs.readFile(f.queuePath, 'utf8'), beforeQueue, 'rejected reconciliation cannot rewrite queue state');
+    assert.equal(await fs.readFile(f.runPath, 'utf8').catch(error => { if (error.code !== 'ENOENT') throw error; }), beforeRun,
+        'reconciliation cannot rewrite the old run');
+    assert.deepEqual(f.calls, calls, 'reconciliation never invokes host callbacks');
+}
+
+test('preparation recovery only records reconciliation, then a NEW prepare and both judges are required', async t => {
+    const f = await preparationRetryFixture(t), oldRun = await fs.readFile(f.runPath, 'utf8');
+    const calls = [...f.calls];
+    const recovered = await retryProductionPreparation(f.retryOptions);
+    assert.deepEqual(f.calls, calls);
+    const audit = recovered.preparationRetries[0];
+    assert.ok(Number.isFinite(Date.parse(audit.at)));
+    assert.deepEqual(audit, { oldRunId: f.before.pending.runId, checkpointId: f.before.history[0].checkpointId,
+        assetId: 'a', revision: 1, catalogHash: f.before.catalogHash, reason: f.retryOptions.reason, at: audit.at });
+    const expected = { ...f.before, status: 'PAUSED', preparationRetries: [audit] };
+    delete expected.pending;
+    assert.deepEqual(recovered, expected); assert.deepEqual(await f.state(), expected);
+    assert.equal(await fs.readFile(f.runPath, 'utf8'), oldRun);
+    await assertPreparationRetryRejected(f);
+    f.options.adapters.prepare = async args => {
+        assert.notEqual(args.runId, f.before.pending.runId);
+        assert.deepEqual(args.history, f.before.history);
+        assert.deepEqual((await f.store.get(args.runId)).effects.map(e => [e.nodeId, e.status]), [['prepare', 'started']]);
+        return f.prepare(args);
+    };
+    const produced = await runProductionQueue({ ...f.options, maxAssetsPerSession: 1 });
+    assert.equal(produced.status, 'PAUSED'); assert.equal(produced.current, 1);
+    assert.equal(produced.approvals.length, 1); assert.equal(produced.approvals[0].runId, produced.runIds[1]);
+    assert.equal(produced.runIds.length, 2); assert.deepEqual(produced.history[0], f.before.history[0]);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('prepare')), ['prepare:a:1', 'prepare:a:1']);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1']);
+    assert.equal(f.calls.filter(c => c.startsWith('review')).length, 2);
+    assert.equal(await fs.readFile(f.runPath, 'utf8'), oldRun, 'superseded old wait run/checkpoints are immutable');
+});
+
+test('preparation recovery is optimistic, append-only across repeated BLOCKED preparations and never resumes old runs', async t => {
+    const f = await preparationRetryFixture(t);
+    await retryProductionPreparation(f.retryOptions);
+    const again = await runProductionQueue(f.options);
+    assert.equal(again.status, 'WAITING'); assert.equal(again.revision, 1); assert.equal(again.current, 0);
+    await assertPreparationRetryRejected(f);
+    const recovered = await retryProductionPreparation({ ...f.retryOptions, expectedRunId: again.pending.runId, reason: 'Second host protocol correction.' });
+    assert.equal(recovered.preparationRetries.length, 2);
+    assert.deepEqual(recovered.runIds, again.runIds); assert.deepEqual(recovered.history, again.history);
+    assert.equal((await f.store.get(f.before.pending.runId)).status, 'waiting');
+    assert.equal((await f.store.get(again.pending.runId)).status, 'waiting');
+    assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), []);
+});
+
+test('preparation recovery preserves previous approvals, revision and unresolved findings', async t => {
+    const f = await fixture(t);
+    await runProductionQueue({ ...f.options, maxAssetsPerSession: 1 });
+    const prepare = f.options.adapters.prepare;
+    f.options.adapters.review = async (role, args) => {
+        const review = syntheticReview(role, args);
+        if (role === 'technical') review.assignment.output.improvements = [
+            { id: 'keep-technical', criterionId: 'C2', justification: 'Synthetic issue.', evidenceIds: ['view-all'] }];
+        return review;
+    };
+    await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    f.options.adapters.prepare = async args => { await prepare(args); return { status: 'BLOCKED', reasons: ['Synthetic protocol blocker.'] }; };
+    const before = await runProductionQueue(f.options);
+    assert.equal(before.current, 1); assert.equal(before.revision, 2);
+    assert.deepEqual(before.unresolvedByRole.technical, ['keep-technical']);
+    const recovered = await retryProductionPreparation({ stateDir: f.options.stateDir, expectedRunId: before.pending.runId,
+        expectedCatalogHash: before.catalogHash, reason: 'Host corrected protocol, not artistic requirements.' });
+    for (const key of ['approvals', 'history', 'runIds', 'revision', 'current', 'queue', 'catalogHash', 'unresolvedByRole']) {
+        assert.deepEqual(recovered[key], before[key]);
+    }
+    assert.equal(recovered.status, 'PAUSED'); assert.equal(recovered.pending, undefined);
+});
+
+test('preparation recovery requires nonblank reason, correct expected IDs and the same exclusive queue lock', async t => {
+    const f = await preparationRetryFixture(t);
+    for (const reason of [undefined, '', ' \n ', 1]) await assertPreparationRetryRejected(f, { reason });
+    await assertPreparationRetryRejected(f, { expectedRunId: 'f'.repeat(32) });
+    await assertPreparationRetryRejected(f, { expectedCatalogHash: 'f'.repeat(64) });
+    const lockPath = path.join(f.options.stateDir, 'queue.lock');
+    await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, token: 'synthetic-owner' }), { flag: 'wx' });
+    try {
+        await assertPreparationRetryRejected(f, {}, /queue locked/);
+        await assert.rejects(runProductionQueue(f.options), /queue locked/);
+    } finally { await fs.unlink(lockPath); }
+    const results = await Promise.allSettled([retryProductionPreparation(f.retryOptions), retryProductionPreparation(f.retryOptions)]);
+    assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+    assert.equal((await f.state()).preparationRetries.length, 1);
+});
+
+test('preparation recovery rejects a live run lease even while its saved status is waiting', async t => {
+    const f = await preparationRetryFixture(t), lease = await f.store.claimRunLease(f.retryOptions.expectedRunId);
+    assert.ok(lease);
+    try { await assertPreparationRetryRejected(f, {}, /lease/); }
+    finally { await lease.release(); }
+    assert.equal((await retryProductionPreparation(f.retryOptions)).status, 'PAUSED');
+});
+
+for (const kind of ['stale process identity', 'expired malformed owner', 'expired missing owner']) {
+    test(`preparation recovery leaves existing lease untouched: ${kind}`, async t => {
+        const f = await preparationRetryFixture(t), runId = f.retryOptions.expectedRunId;
+        const leaseRoot = path.join(f.store.root, '.leases'), lockDirectory = path.join(leaseRoot, `${runId}.lock`);
+        const ownerFile = path.join(lockDirectory, 'owner.json'), old = new Date(0);
+        await fs.mkdir(lockDirectory);
+        const owner = kind === 'stale process identity' ? JSON.stringify({ runId, token: 'synthetic-stale-owner', pid: process.pid,
+            processStartedAt: old.toISOString(), createdAt: old.toISOString(), heartbeatAt: old.toISOString(), leaseMs: 15_000 }) : '{';
+        if (kind !== 'expired missing owner') {
+            await fs.writeFile(ownerFile, owner, { flag: 'wx' });
+            await fs.utimes(ownerFile, old, old);
+        }
+        await fs.utimes(lockDirectory, old, old);
+        const before = await fs.stat(lockDirectory), entries = await fs.readdir(leaseRoot);
+        await assertPreparationRetryRejected(f, {}, /stale recovery is disabled/);
+        assert.deepEqual(await fs.readdir(leaseRoot), entries, 'no quarantine or replacement lease may be created');
+        const after = await fs.stat(lockDirectory);
+        assert.equal(after.ino, before.ino); assert.equal(after.mtimeMs, before.mtimeMs);
+        if (kind === 'expired missing owner') await assert.rejects(fs.access(ownerFile), { code: 'ENOENT' });
+        else {
+            assert.equal(await fs.readFile(ownerFile, 'utf8'), owner);
+            assert.equal((await fs.stat(ownerFile)).mtimeMs, old.getTime());
+        }
+        assert.deepEqual(await f.state(), f.before, 'pending and reconciliation audit remain unchanged');
+    });
+}
+
+test('no-stale-recovery concurrent claimers cannot replace a fresh lease using cached stale owner data', { timeout: 10_000 }, async t => {
+    const f = await preparationRetryFixture(t), runId = f.retryOptions.expectedRunId;
+    const ownerFile = path.join(f.store.root, '.leases', `${runId}.lock`, 'owner.json');
+    const replacement = await f.store.claimRunLease(runId, { recoverStale: false });
+    assert.ok(replacement);
+    const owner = await fs.readFile(ownerFile, 'utf8'), readFile = fs.readFile.bind(fs), rename = fs.rename.bind(fs);
+    const stale = JSON.stringify({ ...JSON.parse(owner), token: 'superseded-synthetic-owner', processStartedAt: new Date(0).toISOString() });
+    let ownerReads = 0, renames = 0, results = [];
+    // Inject an obsolete observation while a newer lease actually owns the path.
+    // The opt-out must return on EEXIST before consulting that stale observation.
+    const readMock = t.mock.method(fs, 'readFile', async (file, ...args) => {
+        if (typeof file === 'string' && path.resolve(file) === path.resolve(ownerFile)) { ownerReads++; return stale; }
+        return readFile(file, ...args);
+    });
+    const renameMock = t.mock.method(fs, 'rename', async (...args) => { renames++; return rename(...args); });
+    try {
+        results = await Promise.allSettled([new FlowStudioFileRunStore(f.store.root), new FlowStudioFileRunStore(f.store.root)]
+            .map(store => store.claimRunLease(runId, { recoverStale: false })));
+        assert.deepEqual(results, [{ status: 'fulfilled', value: undefined }, { status: 'fulfilled', value: undefined }]);
+        await assertPreparationRetryRejected(f, {}, /lease/);
+        assert.equal(ownerReads, 0, 'staleness must not be evaluated on the opt-out path');
+        assert.equal(renames, 0, 'neither contender can quarantine the replacement lease');
+        readMock.mock.restore(); renameMock.mock.restore();
+        await replacement.assertOwned();
+        assert.equal(await fs.readFile(ownerFile, 'utf8'), owner);
+        assert.deepEqual(await f.state(), f.before);
+    } finally {
+        readMock.mock.restore(); renameMock.mock.restore();
+        for (const result of results) if (result.status === 'fulfilled' && result.value) await result.value.release();
+        await replacement.release();
+    }
+});
+
+test('run-store retains stale recovery when omitted or explicitly enabled', async t => {
+    const f = await preparationRetryFixture(t), runId = f.retryOptions.expectedRunId;
+    const lockDirectory = path.join(f.store.root, '.leases', `${runId}.lock`), ownerFile = path.join(lockDirectory, 'owner.json');
+    for (const options of [undefined, { recoverStale: true }]) {
+        await fs.mkdir(lockDirectory);
+        await fs.writeFile(ownerFile, '{', { flag: 'wx' });
+        await fs.utimes(ownerFile, new Date(0), new Date(0));
+        await fs.utimes(lockDirectory, new Date(0), new Date(0));
+        const lease = options === undefined ? await f.store.claimRunLease(runId) : await f.store.claimRunLease(runId, options);
+        assert.ok(lease, 'legacy callers still recover stale leases by default');
+        try { await lease.assertOwned(); assert.equal(JSON.parse(await fs.readFile(ownerFile, 'utf8')).token, lease.token); }
+        finally { await lease.release(); }
+    }
+    assert.deepEqual(await f.state(), f.before);
+    assert.deepEqual(f.calls, ['prepare:a:1']);
+});
+
+for (const [name, mutate] of [
+    ['catalog mutation', s => { s.queue[0].family = 'changed'; }],
+    ['cursor outside queue', s => { s.current = s.queue.length; }],
+    ['wrong queue status', s => { s.status = 'RUNNING'; }],
+    ['missing pending', s => { delete s.pending; }],
+    ['wrong pending entry', s => { s.pending.entry.id = 'different'; }],
+    ['wrong pending revision', s => { s.pending.revision++; }],
+    ['wrong idempotency key', s => { s.pending.idempotencyKey = 'different'; }],
+    ['crash without history', s => { s.history = []; }],
+    ['wrong history asset', s => { s.history[0].assetId = 'different'; }],
+    ['wrong history revision', s => { s.history[0].revision++; }],
+    ['wrong history run ID', s => { s.history[0].runId = 'f'.repeat(32); }],
+    ['extra mutation output', s => { s.history[0].outputs.produce = null; }],
+    ['READY instead of BLOCKED', s => { s.history[0].outputs.prepare = { status: 'READY', brief: 'not blocked' }; }],
+    ['malformed BLOCKED reasons', s => { s.history[0].outputs.prepare.reasons = []; }],
+    ['raw history differs from ledger', s => { s.history[0].outputs.prepare.constructor = false; }],
+    ['unproven effect IDs', s => { s.history[0].effectIds = ['different-effect']; }],
+    ['invented approval', s => { s.approvals.push({ assetId: 'a', revision: 1 }); }],
+    ['changed outstanding IDs', s => { s.unresolvedByRole.artistic = ['invented']; }],
+    ['bad reconciliation audit', s => { s.preparationRetries = [{ oldRunId: 'unknown' }]; }]
+]) {
+    test(`preparation recovery rejects invalid owner state: ${name}`, async t => {
+        const f = await preparationRetryFixture(t), state = await f.state();
+        mutate(state);
+        await fs.writeFile(f.queuePath, JSON.stringify(state));
+        await assertPreparationRetryRejected(f);
+    });
+}
+
+for (const [name, mutate] of [
+    ['running', r => { r.status = 'running'; }],
+    ['failed', r => { r.status = 'failed'; }],
+    ['cancelled', r => { r.status = 'cancelled'; }],
+    ['completed', r => { r.status = 'completed'; }],
+    ['run identity mismatch', r => { r.input.pending.token = 'different'; }],
+    ['missing effects', r => { r.effects = []; }],
+    ['started receipt', r => { r.effects[0].status = 'started'; }],
+    ['uncertain receipt', r => { r.effects[0].status = 'uncertain'; }],
+    ['failed receipt', r => { r.effects[0].status = 'failed'; }],
+    ['mutable prepare', r => { r.effects[0].kind = 'command'; }],
+    ['wrong tool', r => { r.effects[0].toolId = 'host:produce'; }],
+    ['missing raw response', r => { delete r.effects[0].output; }],
+    ['raw READY hidden by BLOCKED context', r => { r.effects[0].output.prepare = { status: 'READY', brief: 'different original' }; }],
+    ['raw response field sanitized away', r => { r.effects[0].output.prepare.constructor = false; }],
+    ['read-only freeze receipt', r => { r.effects.push({ ...r.effects[0], id: 'other', kind: 'read', nodeId: 'freeze', toolId: 'host:freeze' }); }],
+    ['read-only judge receipt', r => { r.effects.push({ ...r.effects[0], id: 'other', kind: 'read', nodeId: 'technical', toolId: 'host:technical' }); }],
+    ['earlier checkpoint contains a mutation', r => { r.checkpoints[0].effects.push({ ...r.effects[0], id: 'other', kind: 'command', nodeId: 'produce' }); }],
+    ['producer ever started in events', r => { r.events.push({ kind: 'effect.started', nodeId: 'produce', runId: r.id, detail: { effectId: 'other' } }); }],
+    ['judge ever started in visits', r => { r.result.visited.push('artistic'); }],
+    ['nested result contains hidden mutation', r => { r.result.effects = [{ ...r.effects[0], kind: 'command', nodeId: 'produce' }]; }],
+    ['missing checkpoint', r => { r.checkpoints.pop(); }],
+    ['wrong authoritative checkpoint', r => { r.result.waiting.checkpointId = r.checkpoints[0].id; }],
+    ['unsafe checkpoint continuation', r => { r.checkpoints.at(-1).nextNodeId = 'produce'; }],
+    ['changed graph digest', r => { r.graph.name = 'changed after waiting'; }],
+    ['unsafe wait continuation', r => { r.graph.nodes.find(n => n.id === 'wait').next = 'produce'; }],
+    ['replay instead of original run', r => { r.parentRunId = 'f'.repeat(32); }]
+]) {
+    test(`preparation recovery rejects unsafe/missing run evidence: ${name}`, async t => {
+        const f = await preparationRetryFixture(t), record = await f.store.get(f.retryOptions.expectedRunId);
+        mutate(record);
+        // Deliberately corrupt synthetic persistent evidence, never real control files.
+        await fs.writeFile(f.runPath, JSON.stringify(record));
+        await assertPreparationRetryRejected(f);
+    });
+}
+
+test('preparation recovery rejects missing and malformed persisted run files without repairing them', async t => {
+    const f = await preparationRetryFixture(t);
+    await fs.unlink(f.runPath);
+    await assertPreparationRetryRejected(f, {}, /missing/);
+    await fs.writeFile(f.runPath, '{');
+    await assertPreparationRetryRejected(f);
+    await fs.writeFile(f.runPath, '{}');
+    await assertPreparationRetryRejected(f);
+});
+
+test('preparation recovery compares original raw receipts, not sanitized checkpoint context', async t => {
+    const blocked = JSON.parse('{"status":"BLOCKED","reasons":["Synthetic protocol mismatch."],"constructor":false,"__proto__":false}');
+    const f = await fixture(t, { prepare: async () => blocked });
+    const before = await runProductionQueue(f.options), runId = before.pending.runId;
+    const record = await f.store.get(runId);
+    assert.equal(Object.hasOwn(record.checkpoints.at(-1).context.prepare, 'constructor'), false);
+    assert.equal(Object.hasOwn(record.effects[0].output.prepare, 'constructor'), true);
+    const recovered = await retryProductionPreparation({ stateDir: f.options.stateDir, expectedRunId: runId,
+        expectedCatalogHash: before.catalogHash, reason: 'Host explicitly corrects blocked protocol.' });
+    assert.equal(recovered.status, 'PAUSED'); assert.deepEqual(recovered.history[0].outputs.prepare, blocked);
+    assert.deepEqual(recovered.history, before.history);
+});
+
+test('preparation recovery accepts a consistent completed none-effect preparation, never a mutable effect', async t => {
+    const f = await preparationRetryFixture(t), record = await f.store.get(f.retryOptions.expectedRunId);
+    // Synthetic persisted equivalent of the same read-only host preparation with effect:none.
+    record.graph.nodes.find(n => n.id === 'prepare').tools[0].effect = 'none';
+    record.effects[0].kind = 'none';
+    const graphDigest = hash(JSON.stringify(record.graph));
+    for (const checkpoint of record.checkpoints) { checkpoint.effects = structuredClone(record.effects); checkpoint.graphDigest = graphDigest; }
+    for (const event of record.events) if (event.kind === 'effect.started') event.detail.kind = 'none';
+    await fs.writeFile(f.runPath, JSON.stringify(record));
+    const beforeRun = await fs.readFile(f.runPath, 'utf8');
+    assert.equal((await retryProductionPreparation(f.retryOptions)).status, 'PAUSED');
+    assert.equal(await fs.readFile(f.runPath, 'utf8'), beforeRun);
+});
+
+for (const mode of ['producer uncertainty', 'read-only freeze BLOCKED', 'read-only missing review', 'frozen mutation', 'prepare throws']) {
+    test(`preparation recovery never unlocks other WAIT causes: ${mode}`, async t => {
+        const f = await fixture(t);
+        if (mode === 'producer uncertainty') f.options.adapters.produce = async () => { throw new Error('Unknown producer completion.'); };
+        if (mode === 'read-only freeze BLOCKED') {
+            f.options.adapters.freezeEffect = 'read';
+            f.options.adapters.freeze = async () => ({ status: 'BLOCKED', reasons: ['Read-only freeze failed.'] });
+        }
+        if (mode === 'read-only missing review') { f.options.adapters.reviewEffect = 'read'; f.options.adapters.review = async () => ({}); }
+        if (mode === 'frozen mutation') f.options.adapters.verifyFrozen = async () => false;
+        if (mode === 'prepare throws') f.options.adapters.prepare = async () => { throw new Error('No completed preparation.'); };
+        const before = await runProductionQueue(f.options);
+        assert.equal(before.status, 'WAITING');
+        await assertPreparationRetryRejected({ ...f, queuePath: path.join(f.options.stateDir, 'queue.json'),
+            runPath: f.store.pathFor(before.pending.runId), retryOptions: { stateDir: f.options.stateDir,
+                expectedRunId: before.pending.runId, expectedCatalogHash: before.catalogHash, reason: 'Not eligible despite this reason.' } });
+    });
+}

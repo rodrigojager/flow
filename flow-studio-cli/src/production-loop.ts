@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import {
     validateProductionReview, type FrozenProductionManifest, type ProductionReviewerRole,
     type ProductionReviewResult, type TrustedProductionReviewerAssignment,
@@ -48,6 +49,8 @@ export interface ProductionQueueState {
     unresolvedByRole: Outstanding;
     approvals: Array<{ assetId: string; revision: number; runId: string; manifestHash: string }>;
     pending?: { token: string; entry: ProductionCatalogEntry; revision: number; idempotencyKey: string; runId?: string };
+    /** Superseded read-only preparation runs remain unchanged in runs/ and history. */
+    preparationRetries?: Array<{ oldRunId: string; checkpointId: string; assetId: string; revision: number; catalogHash: string; reason: string; at: string }>;
 }
 export interface ProductionInvocation {
     entry: ProductionCatalogEntry; assetId: string; revision: number; idempotencyKey: string;
@@ -74,6 +77,121 @@ export interface ProductionQueueOptions {
     /** Per revision, including host callbacks. Default: 30 minutes. */
     timeoutMs?: number;
     signal?: AbortSignal;
+}
+export interface ProductionPreparationRetryOptions {
+    stateDir: string;
+    expectedRunId: string;
+    expectedCatalogHash: string;
+    reason: string;
+}
+
+/** Host-only reconciliation, not replay: permits a NEW preparation invocation on
+ * the next runProductionQueue call. No callbacks, approvals or old-run writes.
+ * Existing run leases are always rejected here, even when apparently stale. */
+export async function retryProductionPreparation(options: ProductionPreparationRetryOptions): Promise<ProductionQueueState> {
+    const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+    const ids = (value: unknown): value is string[] => Array.isArray(value) && value.every(text) && new Set(value).size === value.length;
+    if (!text(options.reason) || !text(options.stateDir) || !text(options.expectedRunId)
+        || !/^[a-zA-Z0-9:_-]{8,160}$/.test(options.expectedRunId) || !/^[0-9a-f]{64}$/.test(options.expectedCatalogHash)) {
+        throw new Error('Preparation retry requires a nonblank reason, stateDir and valid expected run/catalog IDs.');
+    }
+    const root = await fs.realpath(options.stateDir), target = path.join(root, 'queue.json');
+    const release = await acquireProductionQueueLock(root);
+    try {
+        const serialized = await fs.readFile(target, 'utf8');
+        const state: ProductionQueueState = JSON.parse(serialized);
+        if (!state || state.version !== 1 || state.status !== 'WAITING' || state.catalogHash !== options.expectedCatalogHash
+            || !Array.isArray(state.queue) || !state.queue.every(e => e && typeof e === 'object' && !Array.isArray(e) && text(e.id))
+            || !ids(state.queue.map(e => e.id)) || hash(state.queue) !== state.catalogHash
+            || !Number.isSafeInteger(state.current) || state.current < 0 || state.current >= state.queue.length
+            || !Number.isSafeInteger(state.revision) || state.revision < 1 || !Array.isArray(state.reasons) || !state.reasons.every(text)
+            || !ids(state.runIds) || state.runIds.at(-1) !== options.expectedRunId || !Array.isArray(state.history) || !state.history.length
+            || !Array.isArray(state.approvals) || state.approvals.length !== state.current
+            || !state.unresolvedByRole || !isDeepStrictEqual(Object.keys(state.unresolvedByRole).sort(), ['artistic', 'technical'])
+            || !ids(state.unresolvedByRole.artistic) || !ids(state.unresolvedByRole.technical)) {
+            throw new Error('Invalid canonical WAITING queue state or changed catalog; preparation retry denied.');
+        }
+        const entry = state.queue[state.current], pending = state.pending, latest = state.history.at(-1)!;
+        const key = `production:${state.catalogHash}:${hash(entry.id)}:${state.revision}`;
+        const preparation = latest?.outputs?.prepare;
+        if (!pending || pending.runId !== options.expectedRunId || !text(pending.token) || pending.revision !== state.revision
+            || pending.idempotencyKey !== key || !isDeepStrictEqual(pending.entry, entry)
+            || latest?.runId !== pending.runId || latest.assetId !== entry.id || latest.revision !== state.revision
+            || latest.result?.verdict !== 'WAIT' || !text(latest.checkpointId) || !ids(latest.effectIds) || latest.effectIds.length !== 1
+            || !isDeepStrictEqual(Object.keys(latest.outputs), ['prepare']) || preparation?.status !== 'BLOCKED'
+            || !Array.isArray(preparation.reasons) || !preparation.reasons.length || !preparation.reasons.every(text)
+            || !isDeepStrictEqual(latest.result.reasons, preparation.reasons)
+            || state.history.some((h, i) => !h || h.runId !== state.runIds[i]) || state.history.length !== state.runIds.length
+            || state.history.slice(0, -1).some(h => h.assetId === entry.id && h.revision === state.revision
+                && (!state.preparationRetries?.some(r => r.oldRunId === h.runId) || !isDeepStrictEqual(Object.keys(h.outputs), ['prepare'])))
+            || state.approvals.some((a, i) => !a || a.assetId !== state.queue[i].id || !Number.isSafeInteger(a.revision) || a.revision < 1
+                || !state.history.some(h => h.runId === a.runId && h.assetId === a.assetId && h.revision === a.revision
+                    && h.result?.verdict === 'ACCEPT' && !isProductionCorrection(h.outputs.freeze) && h.outputs.freeze?.manifest.manifestHash === a.manifestHash))
+            || (state.preparationRetries !== undefined && (!Array.isArray(state.preparationRetries)
+                || !ids(state.preparationRetries.map(r => r?.oldRunId)) || state.preparationRetries.some(r => !r
+                    || r.oldRunId === pending.runId || r.catalogHash !== state.catalogHash || !text(r.reason) || !Number.isFinite(Date.parse(r.at))
+                    || !state.history.some(h => h.runId === r.oldRunId && h.assetId === r.assetId && h.revision === r.revision
+                        && h.checkpointId === r.checkpointId && h.outputs?.prepare?.status === 'BLOCKED' && h.result?.verdict === 'WAIT'))))) {
+            throw new Error('Pending revision is not the matching, completed BLOCKED preparation history.');
+        }
+        const store = new FlowStudioFileRunStore(path.join(root, 'runs'));
+        if (!await store.get(pending.runId)) throw new Error('Preparation run is missing; retry denied.');
+        const lease = await store.claimRunLease(pending.runId, { recoverStale: false });
+        if (!lease) throw new Error('Preparation run already has a lease; stale recovery is disabled for preparation retry.');
+        try {
+            const record = await store.get(pending.runId), stages = ['prepare', 'ready', 'wait'];
+            if (!record || record.status !== 'waiting' || record.error !== undefined || record.parentRunId !== undefined
+                || record.result?.status !== 'waiting' || record.result.runId !== pending.runId || record.result.error !== undefined || record.result.parentRunId !== undefined
+                || record.graph.id !== 'production-revision' || record.graph.version !== 'flow-studio/v2' || record.graph.start !== 'prepare'
+                || record.result.graphId !== record.graph.id || !isDeepStrictEqual(record.result.visited, stages)
+                || !isDeepStrictEqual(record.input.entry, entry) || record.input.revision !== state.revision || record.input.catalogHash !== state.catalogHash
+                || !isDeepStrictEqual(record.input.unresolvedByRole, state.unresolvedByRole)
+                || !isDeepStrictEqual(record.input.pending, { token: pending.token, entry, revision: state.revision, idempotencyKey: key })
+                || record.effects.length !== 1 || !isDeepStrictEqual(record.effects.map(e => e.id), latest.effectIds)) {
+                throw new Error('Persisted run is not the original waiting preparation-only invocation.');
+            }
+            const effect = record.effects[0], checkpoint = record.checkpoints.at(-1);
+            const graphDigest = createHash('sha256').update(JSON.stringify(record.graph)).digest('hex');
+            const tool = record.graph.nodes.find(n => n.id === 'prepare')?.tools?.[0];
+            const events = ['run.started', 'node.enter', 'node.success', 'effect.started', 'effect.completed', 'checkpoint.created', 'wait.started', 'budget.updated'];
+            // Compare the complete raw receipt, not deepMerge-sanitized checkpoint context.
+            if (effect.nodeId !== 'prepare' || effect.toolId !== 'host:prepare' || effect.runId !== pending.runId
+                || effect.status !== 'completed' || !['read', 'none'].includes(effect.kind) || effect.error !== undefined
+                || effect.idempotencyKey !== `${key}:prepare` || !text(effect.inputDigest)
+                || !Number.isFinite(Date.parse(effect.startedAt)) || !text(effect.finishedAt) || !Number.isFinite(Date.parse(effect.finishedAt))
+                || Date.parse(effect.finishedAt) < Date.parse(effect.startedAt)
+                || !isDeepStrictEqual(effect.output, latest.outputs)
+                || tool?.id !== 'host:prepare' || tool.command !== 'host:prepare' || tool.effect !== effect.kind
+                || tool.idempotencyKey !== effect.idempotencyKey || record.graph.nodes.find(n => n.id === 'prepare')?.type !== 'action'
+                || record.graph.nodes.find(n => n.id === 'wait')?.type !== 'wait' || record.graph.nodes.find(n => n.id === 'wait')?.next !== 'end'
+                || record.graph.nodes.find(n => n.id === 'end')?.type !== 'end'
+                || !checkpoint || checkpoint.id !== latest.checkpointId || checkpoint.reason !== 'wait' || checkpoint.nodeId !== 'wait'
+                || checkpoint.nextNodeId !== 'end' || checkpoint.wait?.kind !== 'event' || checkpoint.wait.eventName !== 'production.reconciled'
+                || record.result.waiting?.checkpointId !== checkpoint.id || record.result.waiting.nodeId !== 'wait' || record.result.waiting.kind !== 'wait'
+                || !isDeepStrictEqual(checkpoint.visited, stages) || !isDeepStrictEqual(record.checkpoints.map(c => c.nodeId), stages)
+                || record.checkpoints.some((c, i) => c.runId !== pending.runId || c.graphId !== record.graph.id || c.graphVersion !== record.graph.version
+                    || c.graphDigest !== graphDigest || c.reason !== (i === 2 ? 'wait' : 'node-complete') || c.metadata?.replayable === false
+                    || c.nextNodeId !== ['ready', 'wait', 'end'][i] || !isDeepStrictEqual(c.visited, stages.slice(0, i + 1)) || !isDeepStrictEqual(c.effects, record.effects))
+                || !isDeepStrictEqual(record.events.filter(e => e.kind === 'node.enter').map(e => e.nodeId), stages)
+                || ['run.started', 'effect.started', 'effect.completed'].some(kind => record.events.filter(e => e.kind === kind).length !== 1)
+                || record.events.some(e => e.runId !== pending.runId || !events.includes(e.kind) || (e.nodeId !== undefined && !stages.includes(e.nodeId))
+                    || (e.kind.startsWith('effect.') && (e.nodeId !== 'prepare' || e.detail?.effectId !== effect.id))
+                    || (e.kind === 'effect.started' && e.detail?.kind !== effect.kind))
+                || (record.result.effects.length > 0 && !isDeepStrictEqual(record.result.effects, record.effects))
+                || (record.result.checkpoints.length > 0 && !isDeepStrictEqual(record.result.checkpoints, record.checkpoints))
+                || (record.result.events.length > 0 && !isDeepStrictEqual(record.result.events, record.events))) {
+                throw new Error('Run receipts/checkpoints contain missing, changed, unsafe or non-preparation evidence; retry denied.');
+            }
+            await lease.assertOwned();
+            if (await fs.readFile(target, 'utf8') !== serialized) throw new Error('Queue changed during preparation reconciliation.');
+            state.preparationRetries = [...(state.preparationRetries || []), { oldRunId: pending.runId, checkpointId: checkpoint.id,
+                assetId: entry.id, revision: state.revision, catalogHash: state.catalogHash, reason: options.reason, at: new Date().toISOString() }];
+            state.status = 'PAUSED';
+            delete state.pending;
+            await atomicSave(target, state);
+            return copy(state);
+        } finally { await lease.release(); }
+    } finally { await release(); }
 }
 
 /**
@@ -121,17 +239,10 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
     }
     const catalogHash = hash(queue), root = path.resolve(options.stateDir), target = path.join(root, 'queue.json');
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
-    const lockPath = path.join(root, 'queue.lock');
-    const lock = await fs.open(lockPath, 'wx', 0o600).catch(error => {
-        if (error.code === 'EEXIST') throw new Error('Production queue locked; verify owner PID before explicit offline recovery. Locks are never stolen.');
-        throw error;
-    });
+    const release = await acquireProductionQueueLock(root);
     const inFlight = new Set<Promise<unknown>>();
     let completion: Promise<FlowStudioRunRecord> | undefined;
-    const release = async () => { await lock.close(); await fs.unlink(lockPath); };
     try {
-        await lock.writeFile(JSON.stringify({ pid: process.pid, token: randomUUID(), startedAt: new Date().toISOString() }));
-        await lock.sync();
         let state: ProductionQueueState;
         try { state = JSON.parse(await fs.readFile(target, 'utf8')); }
         catch (error) {
@@ -342,6 +453,20 @@ function updateOutstanding(outstanding: Outstanding, outputs: ProductionRevision
         }
         outstanding[role] = [...ids];
     }
+}
+
+async function acquireProductionQueueLock(root: string): Promise<() => Promise<void>> {
+    const lockPath = path.join(root, 'queue.lock');
+    const lock = await fs.open(lockPath, 'wx', 0o600).catch(error => {
+        if (error.code === 'EEXIST') throw new Error('Production queue locked; verify owner PID before explicit offline recovery. Locks are never stolen.');
+        throw error;
+    });
+    const release = async () => { await lock.close(); await fs.unlink(lockPath); };
+    try {
+        await lock.writeFile(JSON.stringify({ pid: process.pid, token: randomUUID(), startedAt: new Date().toISOString() }));
+        await lock.sync();
+        return release;
+    } catch (error) { await release(); throw error; }
 }
 
 async function atomicSave(target: string, state: ProductionQueueState): Promise<void> {

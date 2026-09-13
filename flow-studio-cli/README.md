@@ -174,6 +174,14 @@ WAIT or an ambiguous effect never silently advances or replays. Session budgets
 pause work without approving it. Locks are not stolen, including stale locks.
 The owner must explicitly reconcile interrupted work before resuming.
 
+`retryProductionPreparation` is a narrow host-only reconciliation API for a
+completed, read-only preparation that returned BLOCKED. It requires the expected
+run ID, catalog hash and an audit reason, rechecks the original receipts under
+queue/run locks, and only then permits a new preparation call. Existing run
+leases are rejected without stale recovery. It never retries production, freeze
+or review effects, changes grades, advances an asset, or rewrites the old run.
+Other waiting/ambiguous states still require operation-specific reconciliation.
+
 CyberVinci `read` and `edit` permission aliases are indivisible: request and
 classify the full group or the bridge rejects the policy before launching. Prefer
 immutable attachments and no native tools for judges. `--pure` is retained to

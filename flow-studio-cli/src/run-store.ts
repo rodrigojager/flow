@@ -148,7 +148,8 @@ export class FlowStudioFileRunStore {
         return path.join(this.root, `${runId}.json`);
     }
 
-    async claimRunLease(runId: string): Promise<FlowStudioRunLease | undefined> {
+    /** recoverStale defaults to true; false never inspects or replaces an existing lease. */
+    async claimRunLease(runId: string, options: { recoverStale?: boolean } = {}): Promise<FlowStudioRunLease | undefined> {
         assertRunId(runId);
         await this.initialize();
         const leaseRoot = path.join(this.root, '.leases');
@@ -178,6 +179,7 @@ export class FlowStudioFileRunStore {
                 return createRunLease(runId, token, lockDirectory, ownerFile);
             } catch (error) {
                 if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+                if (options.recoverStale === false) return undefined;
                 if (!await runLeaseIsStale(lockDirectory, ownerFile)) return undefined;
                 const quarantine = `${lockDirectory}.stale.${token}`;
                 try {
