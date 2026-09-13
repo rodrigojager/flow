@@ -13,7 +13,22 @@ import { FlowStudioFileRunStore, type FlowStudioRunRecord } from './run-store';
 
 export interface ProductionCatalogEntry { id: string; [key: string]: unknown }
 export type ProductionPreparation = { status: 'READY'; brief: unknown } | { status: 'BLOCKED'; reasons: string[] };
-export interface ProductionReceipt { invocationId: string; sessionId: string; [key: string]: unknown }
+/** Missing status preserves the shipped full-delivery receipt API. */
+export interface ProductionReceipt { invocationId: string; sessionId: string; status?: 'DELIVERED'; [key: string]: unknown }
+export interface ProductionProgressCheckpoint {
+    id: string;
+    files: Array<{ path: string; sha256: string; [key: string]: unknown }>;
+    [key: string]: unknown;
+}
+/** Host-classified completed native invocation with a new partial checkpoint, not a model claim or approval. */
+export interface ProductionProgress {
+    status: 'IN_PROGRESS';
+    invocationId: string;
+    sessionId: string;
+    reasons: string[];
+    checkpoint: ProductionProgressCheckpoint;
+    [key: string]: unknown;
+}
 export interface ProductionFrozen {
     manifest: FrozenProductionManifest;
     producerSessionId: string;
@@ -50,7 +65,9 @@ export interface ProductionRevisionOutputs {
     enrollArtistic?: ProductionReviewerEnrollment;
     enrollTechnical?: ProductionReviewerEnrollment;
     enrollment?: { ok: boolean; reasons: string[]; briefPolicyHash: string; sourceRunId: string; reviewerEnrollments?: ProductionReviewerEnrollments };
-    produce?: ProductionReceipt;
+    produce?: ProductionReceipt | ProductionProgress;
+    production?: { status: 'DELIVERED' | 'IN_PROGRESS' | 'WAIT'; reasons: string[] };
+    verifyProgress?: { ok: boolean; reasons: string[] };
     freeze?: ProductionFrozen | ProductionCorrection;
     verify?: { ok: boolean; reasons: string[]; correction?: true };
     artistic?: ProductionJudgeReview;
@@ -82,7 +99,8 @@ export interface ProductionInvocation {
 export interface ProductionAdapters {
     prepare(args: ProductionInvocation): Promise<ProductionPreparation>;
     enrollReviewer?(role: ProductionReviewerRole, args: ProductionInvocation & { brief: unknown; readonly: true }): Promise<ProductionReviewerEnrollment>;
-    produce(args: ProductionInvocation & { brief: unknown }): Promise<ProductionReceipt>;
+    produce(args: ProductionInvocation & { brief: unknown }): Promise<ProductionReceipt | ProductionProgress>;
+    verifyProgress?(args: ProductionInvocation & { brief: unknown; progress: ProductionProgress; readonly: true }): Promise<boolean>;
     freeze(args: ProductionInvocation & { brief: unknown; receipt: ProductionReceipt }): Promise<ProductionFrozen | ProductionCorrection>;
     verifyFrozen(args: ProductionInvocation & { frozen: ProductionFrozen; phase: 'before-review' | 'before-approval' }): Promise<boolean>;
     review(role: ProductionReviewerRole, args: ProductionInvocation & { frozen: ProductionFrozen; enrollment?: ProductionReviewerEnrollment }): Promise<ProductionJudgeReview>;
@@ -223,6 +241,13 @@ export async function retryProductionPreparation(options: ProductionPreparationR
  * and returned values are copied, never references to owner state. The host MUST
  * isolate agents from stateDir (including runs/), control files and other writers.
  * prepare/verifyFrozen are read-only; freeze/review effects must describe reality.
+ * IN_PROGRESS is only a host classification of a completed native call. Required
+ * verifyProgress must independently verify native completion, no denied/error
+ * outcome, actual new checkpoint files/digests, allowed roots and preservation of
+ * prior files/full scope. A descriptor or model's verified:true is not proof.
+ * Progress is never graded: only host true permits REVISE with the entire receipt
+ * preserved for handoff. Producer invocation IDs are fresh; producer sessions may
+ * continue, but may never reuse any grading/enrollment invocation/session identity.
  * freeze may return a host-audited ProductionCorrection for a completed INVALID
  * import. Its top-level status is reserved for REVISE, with nonblank reasons;
  * BLOCKED/malformed statuses wait, and exceptions remain uncertain, never retries.
@@ -249,10 +274,12 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
         if (typeof source?.[method] !== 'function') throw new Error(`Production adapter ${method} must be a function.`);
     }
     if (source.enrollReviewer !== undefined && typeof source.enrollReviewer !== 'function') throw new Error('Production adapter enrollReviewer must be a function.');
+    if (source.verifyProgress !== undefined && typeof source.verifyProgress !== 'function') throw new Error('Production adapter verifyProgress must be a function.');
     const host: ProductionAdapters = {
         prepare: source.prepare.bind(source), produce: source.produce.bind(source), freeze: source.freeze.bind(source),
         verifyFrozen: source.verifyFrozen.bind(source), review: source.review.bind(source),
         enrollReviewer: source.enrollReviewer?.bind(source),
+        verifyProgress: source.verifyProgress?.bind(source),
         freezeEffect: source.freezeEffect, reviewEffect: source.reviewEffect, reviewEndpoint: source.reviewEndpoint
     };
     const limit = options.maxRevisionsPerSession, assets = options.maxAssetsPerSession ?? Number.MAX_SAFE_INTEGER;
@@ -333,9 +360,11 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                                 enrollmentBrief: ((enrollmentOrigin?.outputs.prepare ?? outputs.prepare) as { brief: unknown }).brief
                             } : {}) }), runId: args.runId, signal: args.signal! }, copy(outputs));
                         args.signal!.throwIfAborted();
+                        // Classify the original reply before JSON copying can omit an invalid status:undefined.
+                        const routing = id === 'produce' ? { production: classifyProductionOutput(value, state.history, outputs.enrollment?.reviewerEnrollments, entry.id) } : {};
                         const saved = copy(value);
-                        Object.assign(outputs, { [id]: saved });
-                        return { output: { [id]: copy(saved) } };
+                        Object.assign(outputs, { [id]: saved }, routing);
+                        return { output: { [id]: copy(saved), ...copy(routing) } };
                     })();
                     inFlight.add(task);
                     try { return await task; } finally { inFlight.delete(task); }
@@ -375,7 +404,16 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                 if (host.enrollReviewer && (!raw.enrollment?.ok || !args.reviewerEnrollments)) throw new Error('Both reviewer enrollments must be verified before production.');
                 return host.produce({ ...args, brief: (raw.prepare as { brief: unknown }).brief });
             });
-            bind('freeze', (args, raw) => host.freeze({ ...args, brief: (raw.prepare as { brief: unknown }).brief, receipt: raw.produce! }));
+            bind('verifyProgress', async (args, raw) => {
+                if (raw.production?.status !== 'IN_PROGRESS' || !isProductionProgress(raw.produce)) return { ok: false, reasons: ['Invalid production progress receipt.'] };
+                if (!host.verifyProgress) return { ok: false, reasons: ['IN_PROGRESS requires trusted host verifyProgress.'] };
+                const ok = await host.verifyProgress({ ...args, brief: (raw.prepare as { brief: unknown }).brief, progress: copy(raw.produce), readonly: true }) === true;
+                return { ok, reasons: ok ? [] : ['Host did not verify native completion, new checkpoint and preserved files.'] };
+            });
+            bind('freeze', (args, raw) => {
+                if (raw.production?.status !== 'DELIVERED' || !raw.produce || isProductionProgress(raw.produce)) throw new Error('Freeze requires a full delivery, not partial progress.');
+                return host.freeze({ ...args, brief: (raw.prepare as { brief: unknown }).brief, receipt: raw.produce });
+            });
             bind('verify', async (args, raw) => {
                 const f = raw.freeze, p = raw.produce;
                 if (isProductionCorrection(f)) return { ok: false, correction: true, reasons: f.reasons };
@@ -396,6 +434,9 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                     ...(args.reviewerEnrollments ? { enrollment: args.reviewerEnrollments[role === 'artistic' ? 0 : 1] } : {}) });
             });
             bind('finalize', async (args, raw) => {
+                if (raw.production?.status === 'IN_PROGRESS') return raw.verifyProgress?.ok === true && isProductionProgress(raw.produce)
+                    ? { verdict: 'REVISE', reasons: raw.produce.reasons }
+                    : { verdict: 'WAIT', reasons: ['Unverified progress cannot advance the revision.'] };
                 const frozen = raw.freeze!, reviews = [raw.artistic!, raw.technical!];
                 if (isProductionCorrection(frozen)) return { verdict: 'REVISE', reasons: frozen.reasons };
                 if (await host.verifyFrozen({ ...args, frozen: copy(frozen), phase: 'before-approval' }) !== true) {
@@ -441,7 +482,9 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
             const reasons = failure ? [failure] : interrupted ? ['Revision timed out or cancelled; reconcile effects.']
                 : record?.error ? [record.error] : outputs.prepare?.status === 'BLOCKED' ? outputs.prepare.reasons
                     : outputs.enrollment?.ok === false ? outputs.enrollment.reasons
-                        : outputs.verify?.ok === false ? outputs.verify.reasons : outputs.finalize?.reasons ?? [];
+                        : outputs.production?.status === 'WAIT' ? outputs.production.reasons
+                            : outputs.verifyProgress?.ok === false ? outputs.verifyProgress.reasons
+                                : outputs.verify?.ok === false ? outputs.verify.reasons : outputs.finalize?.reasons ?? [];
             const result: ProductionReviewResult = !failure && !interrupted && !ambiguous && record?.status === 'completed' && outputs.finalize
                 ? copy(outputs.finalize) : { verdict: 'WAIT', reasons: reasons.length ? [...reasons] : ['Revision did not complete; reconcile effects.'] };
             state.history.push(copy({ assetId: entry.id, revision, runId, checkpointId: record?.result?.waiting?.checkpointId
@@ -449,7 +492,7 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
             updateOutstanding(state.unresolvedByRole, outputs, result.verdict !== 'WAIT');
             state.reasons = result.reasons;
             revisions++;
-            if (result.verdict === 'ACCEPT' && !isProductionCorrection(outputs.freeze)) {
+            if (result.verdict === 'ACCEPT' && outputs.production?.status === 'DELIVERED' && !isProductionCorrection(outputs.freeze)) {
                 state.approvals.push({ assetId: entry.id, revision, runId: runId!, manifestHash: outputs.freeze!.manifest.manifestHash });
                 state.current++; state.revision = 1; accepted++;
                 state.unresolvedByRole = { artistic: [], technical: [] };
@@ -483,7 +526,7 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
         version: 'flow-studio/v2', id: 'production-revision', name: 'One frozen production revision', start: 'prepare',
         permissions: { allow: ['tool:read', 'tool:command', 'tool:network'],
             networkHosts: host.reviewEffect === 'network' ? [new URL(host.reviewEndpoint!).hostname] : undefined,
-            commandPatterns: ['host:prepare', 'host:produce', 'host:freeze', 'host:verify', 'host:artistic', 'host:technical', 'host:finalize',
+            commandPatterns: ['host:prepare', 'host:produce', 'host:verifyProgress', 'host:freeze', 'host:verify', 'host:artistic', 'host:technical', 'host:finalize',
                 ...(host.enrollReviewer ? ['host:enrollArtistic', 'host:enrollTechnical', 'host:enrollment'] : [])] },
         budget: { maxSteps: host.enrollReviewer ? 32 : 24, maxDurationMs: timeoutMs, maxParallelism: 2 },
         nodes: [action('prepare', 'read', 'ready'), { id: 'ready', type: 'router', label: 'Ready?' },
@@ -494,7 +537,9 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
                 { id: 'enrollmentJoined', type: 'join', label: 'Both enrollments', join: { strategy: 'all' }, next: 'enrollment' },
                 action('enrollment', 'read', 'enrollmentReady'), { id: 'enrollmentReady', type: 'router', label: 'Both enrolled and policy-bound?' }
             ] satisfies FlowStudioNode[] : []),
-            action('produce', 'command', 'freeze'), action('freeze', host.freezeEffect ?? 'command', 'verify'),
+            action('produce', 'command', 'produced'), { id: 'produced', type: 'router', label: 'Full delivery or verified progress?' },
+            action('verifyProgress', 'read', 'progressReady'), { id: 'progressReady', type: 'router', label: 'Host verified partial checkpoint?' },
+            action('freeze', host.freezeEffect ?? 'command', 'verify'),
             action('verify', 'read', 'frozen'), { id: 'frozen', type: 'router', label: 'Verified freeze?' },
             { id: 'reviews', type: 'fork', label: 'Independent judges', fork: { branches: ['artistic', 'technical'], join: 'joined', maxConcurrency: 2 } },
             action('artistic', host.reviewEffect ?? 'read', 'joined'), action('technical', host.reviewEffect ?? 'read', 'joined'),
@@ -509,6 +554,10 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
                 { from: 'enrollmentReady', to: 'produce', guard: 'context.enrollment.ok === true', priority: 0 },
                 { from: 'enrollmentReady', to: 'wait', priority: 1 }
             ] : []),
+            { from: 'produced', to: 'freeze', guard: 'context.production.status === "DELIVERED"', priority: 0 },
+            { from: 'produced', to: 'verifyProgress', guard: 'context.production.status === "IN_PROGRESS"', priority: 1 },
+            { from: 'produced', to: 'wait', priority: 2 },
+            { from: 'progressReady', to: 'finalize', guard: 'context.verifyProgress.ok === true', priority: 0 }, { from: 'progressReady', to: 'wait', priority: 1 },
             { from: 'frozen', to: 'finalize', guard: 'context.verify.correction === true', priority: 0 },
             { from: 'frozen', to: 'reviews', guard: 'context.verify.ok === true', priority: 1 }, { from: 'frozen', to: 'wait', priority: 2 },
             { from: 'artistic', to: 'joined' }, { from: 'technical', to: 'joined' },
@@ -516,6 +565,37 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
             { from: 'decision', to: 'wait', priority: 1 }
         ]
     };
+}
+
+function isProductionProgress(value: unknown): value is ProductionProgress {
+    const p = value as Partial<ProductionProgress> | null;
+    const text = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+    const record = (v: unknown): boolean => !!v && typeof v === 'object' && !Array.isArray(v)
+        && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+    return record(p) && ['status', 'invocationId', 'sessionId', 'reasons', 'checkpoint'].every(k => Object.hasOwn(p!, k))
+        && p!.status === 'IN_PROGRESS' && text(p!.invocationId) && text(p!.sessionId)
+        && Array.isArray(p!.reasons) && p!.reasons.length > 0 && Array.from(p!.reasons).every(text)
+        && record(p!.checkpoint) && ['id', 'files'].every(k => Object.hasOwn(p!.checkpoint!, k))
+        && text(p!.checkpoint!.id) && Array.isArray(p!.checkpoint!.files) && p!.checkpoint!.files.length > 0
+        && Array.from(p!.checkpoint!.files).every(f => record(f) && Object.hasOwn(f, 'path') && Object.hasOwn(f, 'sha256')
+            && text(f.path) && typeof f.sha256 === 'string' && f.sha256.length === 64 && /^[0-9a-f]{64}$/.test(f.sha256))
+        && new Set(p!.checkpoint!.files.map(f => f.path)).size === p!.checkpoint!.files.length;
+}
+
+function classifyProductionOutput(value: unknown, history: ProductionRevisionHistory[], enrollments: ProductionReviewerEnrollments | undefined, assetId: string): NonNullable<ProductionRevisionOutputs['production']> {
+    const receipt = value as ProductionReceipt | ProductionProgress | null, reasons: string[] = [];
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)
+        || !['invocationId', 'sessionId'].every(k => Object.hasOwn(receipt, k) && typeof receipt[k] === 'string' && receipt[k].trim())) {
+        return { status: 'WAIT', reasons: ['Producer must return trusted nonblank invocation/session IDs.'] };
+    }
+    if ('status' in receipt && receipt.status !== 'DELIVERED' && receipt.status !== 'IN_PROGRESS') reasons.push('Producer status must be DELIVERED or IN_PROGRESS; BLOCKED/unknown outcomes wait.');
+    if (receipt.status === 'IN_PROGRESS' && !isProductionProgress(receipt)) reasons.push('IN_PROGRESS requires nonblank reasons and a checkpoint with a new ID and nonempty unique path/SHA-256 file descriptors.');
+    const reviewers = [...history.flatMap(h => [h.outputs.artistic?.assignment, h.outputs.technical?.assignment, h.outputs.enrollArtistic, h.outputs.enrollTechnical]), ...(enrollments ?? [])];
+    if (reviewers.some(r => r && (r.invocationId === receipt.invocationId || r.sessionId === receipt.sessionId))
+        || history.some(h => h.outputs.produce?.invocationId === receipt.invocationId)) reasons.push('Producer invocation must be new and cannot reuse reviewer/enrollment identities.');
+    if (isProductionProgress(receipt) && history.some(h => h.assetId === assetId && isProductionProgress(h.outputs.produce)
+        && h.outputs.produce.checkpoint.id === receipt.checkpoint.id)) reasons.push('Partial progress must reference a new checkpoint, not a previously handed-off checkpoint ID.');
+    return { status: reasons.length ? 'WAIT' : receipt.status === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'DELIVERED', reasons };
 }
 
 function validateReviewerEnrollments(brief: unknown, values: unknown[], previous?: ProductionRevisionHistory): Omit<NonNullable<ProductionRevisionOutputs['enrollment']>, 'sourceRunId'> {

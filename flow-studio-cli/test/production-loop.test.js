@@ -1209,3 +1209,277 @@ test('enrollment callback cannot be removed mid-asset; stable opaque policy can 
     assert.equal(next.status, 'PAUSED'); assert.equal(next.revision, 3);
     assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 2);
 });
+
+async function progressFixture(t) {
+    const f = await enrollmentFixture(t), deliveredProduce = f.options.adapters.produce;
+    f.options.adapters.produce = async args => {
+        const receipt = await deliveredProduce(args);
+        const checkpointFile = path.join(f.root, `${args.assetId}-${args.revision}-synthetic-checkpoint.blend`);
+        await fs.writeFile(checkpointFile, await fs.readFile(f.artifact));
+        return { ...receipt, status: 'IN_PROGRESS', reasons: [`Synthetic full-family work remains after step ${args.revision}.`],
+            checkpoint: { id: `${args.assetId}-checkpoint-${args.revision}`, files: [{ path: checkpointFile, sha256: hash(await fs.readFile(checkpointFile)) }],
+                audit: JSON.parse('{"constructor":false,"prototype":false,"__proto__":false}') },
+            nativeReceipt: { invocationId: receipt.invocationId, sessionId: receipt.sessionId, completed: true, denied: false, error: null },
+            handoff: { fullScopeHash: args.brief.scopeHash, resumeFrom: checkpointFile, remaining: ['entire remaining synthetic family'] } };
+    };
+    f.options.adapters.verifyProgress = async args => {
+        f.calls.push(`verifyProgress:${args.assetId}:${args.revision}`);
+        assert.equal(args.readonly, true);
+        assert.equal(args.progress.checkpoint.audit.constructor, false, 'host verifier receives the unsanitized original snapshot');
+        assert.equal(args.progress.handoff.fullScopeHash, args.enrollmentBrief.scopeHash);
+        const record = await f.store.get(args.runId);
+        assert.equal(record.effects.find(e => e.nodeId === 'produce').status, 'completed');
+        assert.equal(record.effects.find(e => e.nodeId === 'verifyProgress').status, 'started');
+        const native = args.progress.nativeReceipt;
+        if (native.completed !== true || native.denied !== false || native.error !== null
+            || native.invocationId !== args.progress.invocationId || native.sessionId !== args.progress.sessionId) return false;
+        // Synthetic host proof: current checkpoint AND every previously handed-off file still match their actual bytes.
+        for (const progress of [args.progress, ...args.history.map(h => h.outputs.produce).filter(p => p?.status === 'IN_PROGRESS')]) {
+            for (const file of progress.checkpoint.files) if (hash(await fs.readFile(file.path)) !== file.sha256) return false;
+        }
+        return true;
+    };
+    return { ...f, deliveredProduce };
+}
+
+test('progress partial -> partial -> DELIVERED needs actual host file proof, cached enrollments and two grades before next asset', async t => {
+    const f = await progressFixture(t), partial = f.options.adapters.produce, prepare = f.options.adapters.prepare, freeze = f.options.adapters.freeze;
+    f.options.adapters.produce = async args => args.assetId === 'a' && args.revision < 3 ? partial(args) : { ...await f.deliveredProduce(args), status: 'DELIVERED' };
+    f.options.adapters.prepare = async args => {
+        if (args.assetId === 'a' && args.revision > 1) {
+            const prior = args.history.at(-1).outputs.produce;
+            assert.equal(prior.status, 'IN_PROGRESS');
+            assert.equal(hash(await fs.readFile(prior.checkpoint.files[0].path)), prior.checkpoint.files[0].sha256);
+            assert.equal(prior.handoff.fullScopeHash, hash('full scope'));
+            assert.equal(prior.checkpoint.audit.constructor, false);
+        }
+        return prepare(args);
+    };
+    f.options.adapters.freeze = async args => {
+        assert.equal(args.receipt.status, 'DELIVERED');
+        assert.ok(args.assetId === 'b' || args.revision === 3);
+        return freeze(args);
+    };
+    const state = await runProductionQueue(f.options);
+    assert.equal(state.status, 'COMPLETED', JSON.stringify(state.reasons));
+    assert.deepEqual(state.history.map(h => h.result.verdict), ['REVISE', 'REVISE', 'ACCEPT', 'ACCEPT']);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1', 'produce:a:2', 'produce:a:3', 'produce:b:1']);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('verifyProgress')), ['verifyProgress:a:1', 'verifyProgress:a:2']);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('freeze')), ['freeze:a:3', 'freeze:b:1']);
+    assert.deepEqual(state.approvals.map(a => [a.assetId, a.revision]), [['a', 3], ['b', 1]]);
+    assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 4, 'one pair per asset, not per partial step');
+    for (const history of state.history.slice(0, 2)) {
+        const out = history.outputs, record = await f.store.get(history.runId);
+        assert.equal(out.production.status, 'IN_PROGRESS'); assert.equal(out.verifyProgress.ok, true);
+        assert.deepEqual(out.finalize, { verdict: 'REVISE', reasons: out.produce.reasons });
+        assert.equal(out.freeze, undefined); assert.equal(out.artistic, undefined); assert.equal(out.technical, undefined);
+        assert.equal(record.status, 'completed'); assert.ok(record.effects.every(e => e.status === 'completed'));
+        assert.equal(record.effects.find(e => e.nodeId === 'verifyProgress').kind, 'read');
+        assert.deepEqual(record.effects.find(e => e.nodeId === 'produce').output.produce, out.produce);
+        assert.ok(!record.result.visited.some(id => ['freeze', 'verify', 'reviews', 'artistic', 'technical'].includes(id)));
+    }
+    assert.equal(state.history[1].outputs.enrollment.sourceRunId, state.runIds[0]);
+    assert.equal(state.history[2].outputs.enrollment.sourceRunId, state.runIds[0]);
+    assert.deepEqual(await f.state(), state);
+});
+
+test('progress budget restart continues from the preserved handoff without duplicating prior native invocations', async t => {
+    const f = await progressFixture(t);
+    const first = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    assert.equal(first.status, 'PAUSED'); assert.equal(first.revision, 2); assert.equal(first.pending, undefined);
+    const firstRun = await fs.readFile(f.store.pathFor(first.runIds[0]), 'utf8');
+    const second = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    assert.equal(second.status, 'PAUSED'); assert.equal(second.revision, 3); assert.equal(second.current, 0);
+    assert.equal(new Set(second.history.map(h => h.outputs.produce.invocationId)).size, 2);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1', 'produce:a:2']);
+    assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 2);
+    assert.equal(await fs.readFile(f.store.pathFor(first.runIds[0]), 'utf8'), firstRun);
+    assert.deepEqual(second.history[0], first.history[0]);
+});
+
+test('progress preserves criticisms and full scope; injected 100/PASS/ACCEPT metadata cannot become an approval', async t => {
+    const f = await progressFixture(t), partial = f.options.adapters.produce, review = f.options.adapters.review;
+    f.options.adapters.produce = async args => args.revision === 2 ? { ...await partial(args), total: 100, verdict: 'ACCEPT',
+        finalize: { verdict: 'ACCEPT', reasons: [] }, resolvedFindingIds: ['must-remain'], artistic: { status: 'PASS', total: 100 } }
+        : { ...await f.deliveredProduce(args), status: 'DELIVERED' };
+    f.options.adapters.review = async (role, args) => {
+        const graded = await review(role, args);
+        if (args.revision === 1 && role === 'artistic') graded.assignment.output.improvements = [
+            { id: 'must-remain', criterionId: 'C1', justification: 'Synthetic full-family issue.', evidenceIds: ['view-all'] }];
+        if (args.revision === 3) assert.deepEqual(args.unresolvedByRole.artistic, ['must-remain']);
+        return graded;
+    };
+    const prior = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    const partialState = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    assert.equal(partialState.current, 0); assert.equal(partialState.revision, 3); assert.deepEqual(partialState.approvals, []);
+    assert.deepEqual(partialState.unresolvedByRole, prior.unresolvedByRole);
+    assert.deepEqual(partialState.queue, prior.queue);
+    assert.equal(partialState.history[1].outputs.produce.handoff.fullScopeHash, prior.history[0].outputs.freeze.manifest.scopeHash);
+    assert.deepEqual(partialState.history[1].outputs.finalize, { verdict: 'REVISE', reasons: partialState.history[1].outputs.produce.reasons });
+    assert.equal(partialState.history[1].outputs.artistic, undefined);
+    const accepted = await runProductionQueue({ ...f.options, maxAssetsPerSession: 1 });
+    assert.equal(accepted.current, 1); assert.equal(accepted.approvals[0].revision, 3);
+});
+
+test('progress missing verifier waits permanently by default; adding verifier later cannot replay the producer', async t => {
+    const f = await progressFixture(t), verify = f.options.adapters.verifyProgress;
+    delete f.options.adapters.verifyProgress;
+    const state = await runProductionQueue(f.options);
+    assert.equal(state.status, 'WAITING'); assert.equal(state.revision, 1); assert.equal(state.current, 0);
+    assert.equal(state.history[0].outputs.verifyProgress.ok, false);
+    assert.match(state.reasons.join(' '), /requires trusted host verifyProgress/);
+    const count = f.calls.length;
+    f.options.adapters.verifyProgress = verify;
+    const restarted = await runProductionQueue(f.options);
+    assert.equal(restarted.pending.runId, state.pending.runId); assert.equal(f.calls.length, count);
+    await assert.rejects(retryProductionPreparation({ stateDir: f.options.stateDir, expectedRunId: state.pending.runId,
+        expectedCatalogHash: state.catalogHash, reason: 'This is not a preparation-only wait.' }));
+});
+
+for (const [name, response] of [['false', false], ['nested false', { verified: false }], ['nested true', { verified: true }], ['string true', 'true'], ['numeric true', 1], ['null', null]]) {
+    test(`progress verifier ${name} cannot release the revision`, async t => {
+        const f = await progressFixture(t), partial = f.options.adapters.produce;
+        f.options.adapters.produce = async args => ({ ...await partial(args), verified: true, completed: true });
+        let verifies = 0;
+        f.options.adapters.verifyProgress = async () => { verifies++; return response; };
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.revision, 1); assert.equal(state.current, 0);
+        assert.deepEqual(state.approvals, []); assert.equal(state.history[0].outputs.verifyProgress.ok, false);
+        assert.equal(f.calls.some(c => /^(freeze|review):/.test(c)), false);
+        await runProductionQueue(f.options);
+        assert.equal(verifies, 1); assert.equal(f.calls.filter(c => c.startsWith('produce')).length, 1);
+    });
+}
+
+for (const [name, mutate] of [
+    ['BLOCKED', p => { p.status = 'BLOCKED'; }], ['PASS', p => { p.status = 'PASS'; }], ['unknown status', p => { p.status = 'partial'; }],
+    ['null status', p => { p.status = null; }], ['present undefined status', p => { p.status = undefined; }],
+    ['inherited BLOCKED status', p => { delete p.status; Object.setPrototypeOf(p, { status: 'BLOCKED' }); }],
+    ['empty native ID', p => { p.invocationId = ' '; }], ['missing native session', p => { delete p.sessionId; }],
+    ['missing reasons', p => { delete p.reasons; }], ['empty reasons', p => { p.reasons = []; }], ['blank reason', p => { p.reasons = [' ']; }],
+    ['numeric reason', p => { p.reasons = [100]; }], ['sparse reasons', p => { p.reasons = new Array(1); }],
+    ['missing checkpoint', p => { delete p.checkpoint; }], ['string checkpoint', p => { p.checkpoint = 'new.blend'; }],
+    ['boolean checkpoint', p => { p.checkpoint = true; }], ['arbitrary verified checkpoint', p => { p.checkpoint = { verified: true }; }],
+    ['empty checkpoint', p => { p.checkpoint = {}; }], ['blank checkpoint ID', p => { p.checkpoint.id = ''; }],
+    ['empty file list', p => { p.checkpoint.files = []; }], ['sparse file list', p => { p.checkpoint.files = new Array(1); }],
+    ['bad file hash', p => { p.checkpoint.files[0].sha256 = 'not-sha256'; }], ['hash trailing newline', p => { p.checkpoint.files[0].sha256 += '\n'; }],
+    ['blank file path', p => { p.checkpoint.files[0].path = ''; }],
+    ['duplicate file descriptors', p => { p.checkpoint.files.push({ ...p.checkpoint.files[0] }); }]
+]) {
+    test(`progress malformed/blocked receipt (${name}) waits without verifier, freeze or grading`, async t => {
+        const f = await progressFixture(t), partial = f.options.adapters.produce;
+        f.options.adapters.produce = async args => { const p = await partial(args); mutate(p); return p; };
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0); assert.equal(state.revision, 1);
+        assert.equal(state.history[0].outputs.production.status, 'WAIT'); assert.deepEqual(state.approvals, []);
+        const record = await f.store.get(state.pending.runId);
+        assert.equal(record.effects.find(e => e.nodeId === 'produce').status, 'completed');
+        assert.equal(f.calls.some(c => /^(verifyProgress|freeze|review):/.test(c)), false);
+        const count = f.calls.length; await runProductionQueue(f.options); assert.equal(f.calls.length, count);
+    });
+}
+
+for (const mode of ['new checkpoint mutation', 'prior file mutation', 'native incomplete', 'native denied', 'native error']) {
+    test(`progress host detects ${mode} and keeps WAIT instead of accepting producer claims`, async t => {
+        const f = await progressFixture(t), partial = f.options.adapters.produce;
+        if (mode === 'prior file mutation') await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+        f.options.adapters.produce = async args => {
+            const p = await partial(args);
+            if (mode === 'new checkpoint mutation') await fs.writeFile(p.checkpoint.files[0].path, 'different actual bytes');
+            if (mode === 'prior file mutation') await fs.writeFile(args.history[0].outputs.produce.checkpoint.files[0].path, 'prior file was not preserved');
+            if (mode === 'native incomplete') p.nativeReceipt.completed = false;
+            if (mode === 'native denied') p.nativeReceipt.denied = true;
+            if (mode === 'native error') p.nativeReceipt.error = 'Synthetic denied/error outcome.';
+            return p;
+        };
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0); assert.deepEqual(state.approvals, []);
+        assert.equal(state.history.at(-1).outputs.verifyProgress.ok, false);
+        assert.equal(f.calls.some(c => /^(freeze|review):/.test(c)), false);
+    });
+}
+
+for (const mode of ['duplicate invocation', 'duplicate checkpoint', 'enrollment session', 'enrollment invocation', 'historical grade session', 'historical grade invocation']) {
+    test(`progress rejects ${mode} before host verification`, async t => {
+        const f = await progressFixture(t), partial = f.options.adapters.produce;
+        if (mode.startsWith('duplicate')) await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+        if (mode.startsWith('historical')) {
+            f.options.adapters.produce = f.deliveredProduce;
+            const review = f.options.adapters.review;
+            f.options.adapters.review = async (role, args) => { const r = await review(role, args); r.assignment.output.status = 'REVISE'; return r; };
+            await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+        }
+        f.options.adapters.produce = async args => {
+            const p = await partial(args);
+            if (mode === 'duplicate invocation') p.invocationId = args.history[0].outputs.produce.invocationId;
+            if (mode === 'duplicate checkpoint') p.checkpoint.id = args.history[0].outputs.produce.checkpoint.id;
+            if (mode === 'enrollment session') p.sessionId = args.reviewerEnrollments[0].sessionId;
+            if (mode === 'enrollment invocation') p.invocationId = args.reviewerEnrollments[0].invocationId;
+            if (mode === 'historical grade session') p.sessionId = args.history[0].outputs.artistic.assignment.sessionId;
+            if (mode === 'historical grade invocation') p.invocationId = args.history[0].outputs.artistic.assignment.invocationId;
+            return p;
+        };
+        const verified = f.calls.filter(c => c.startsWith('verifyProgress')).length;
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0);
+        assert.equal(state.history.at(-1).outputs.production.status, 'WAIT'); assert.deepEqual(state.approvals, []);
+        assert.equal(f.calls.filter(c => c.startsWith('verifyProgress')).length, verified);
+    });
+}
+
+for (const phase of ['producer throw', 'producer cancel', 'verifier throw', 'verifier cancel']) {
+    test(`progress ${phase} keeps uncertainty/pending and never replays the producer`, async t => {
+        const f = await progressFixture(t), abort = new AbortController(), partial = f.options.adapters.produce;
+        if (phase.startsWith('producer')) f.options.adapters.produce = async args => {
+            const p = await partial(args);
+            if (phase.endsWith('throw')) throw Object.assign(new Error('Synthetic acknowledgement lost.'), p);
+            abort.abort(); return p;
+        };
+        else f.options.adapters.verifyProgress = async () => {
+            if (phase.endsWith('throw')) throw new Error('Synthetic verification failed.');
+            abort.abort(); return true;
+        };
+        const state = await runProductionQueue({ ...f.options, signal: abort.signal });
+        assert.equal(state.status, 'WAITING'); assert.equal(state.revision, 1); assert.equal(state.current, 0);
+        const record = await f.store.get(state.pending.runId);
+        assert.equal(record.effects.find(e => e.nodeId === (phase.startsWith('producer') ? 'produce' : 'verifyProgress')).status,
+            phase.startsWith('producer') ? 'uncertain' : 'failed');
+        assert.equal(state.history[0].outputs.finalize, undefined);
+        const count = f.calls.length; await runProductionQueue(f.options); assert.equal(f.calls.length, count);
+    });
+}
+
+test('progress optional verifier binds private this and cannot mutate original receipt/checkpoint state', async t => {
+    const f = await progressFixture(t), delegate = f.options.adapters;
+    class ProgressAdapters {
+        #verify = delegate.verifyProgress;
+        prepare = delegate.prepare;
+        enrollReviewer = delegate.enrollReviewer;
+        produce = delegate.produce;
+        freeze = delegate.freeze;
+        verifyFrozen = delegate.verifyFrozen;
+        review = delegate.review;
+        async verifyProgress(args) {
+            const verified = await this.#verify(args);
+            args.progress.status = 'DELIVERED'; args.progress.reasons = [];
+            args.progress.checkpoint.files[0].path = 'must-not-leak';
+            return verified;
+        }
+    }
+    const state = await runProductionQueue({ ...f.options, adapters: new ProgressAdapters(), maxRevisionsPerSession: 1 });
+    assert.equal(state.status, 'PAUSED'); assert.equal(state.revision, 2); assert.deepEqual(state.approvals, []);
+    const p = state.history[0].outputs.produce;
+    assert.equal(p.status, 'IN_PROGRESS'); assert.ok(p.reasons.length);
+    assert.notEqual(p.checkpoint.files[0].path, 'must-not-leak');
+    assert.deepEqual(state.history[0].outputs.finalize, { verdict: 'REVISE', reasons: p.reasons });
+});
+
+test('progress verifier is never used for the shipped statusless delivery API; invalid optional callback fails before state', async t => {
+    const f = await fixture(t);
+    await assert.rejects(runProductionQueue({ ...f.options, adapters: { ...f.options.adapters, verifyProgress: true } }), /verifyProgress must be a function/);
+    await assert.rejects(fs.access(f.options.stateDir), { code: 'ENOENT' });
+    f.options.adapters.verifyProgress = async () => { assert.fail('No partial progress was returned.'); };
+    const state = await runProductionQueue({ ...f.options, maxAssetsPerSession: 1 });
+    assert.equal(state.current, 1); assert.equal(state.history[0].outputs.produce.status, undefined);
+    assert.equal(state.history[0].outputs.production.status, 'DELIVERED'); assert.equal(state.history[0].outputs.verifyProgress, undefined);
+});

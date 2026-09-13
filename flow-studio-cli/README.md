@@ -183,6 +183,16 @@ continuously running workers. Later grading uses fresh independent invocations
 linked to the original enrollment/model and complete role-specific history.
 Removing enrollment after it has been enabled cannot bypass that contract.
 
+For work spanning multiple invocations, `produce` may return host-verified
+`ProductionProgress` (`status: "IN_PROGRESS"`) with its native invocation/session
+and a new checkpoint file descriptor. An explicit read-only `verifyProgress`
+callback is required: the host must verify actual completion, file hashes and
+preservation, not trust a model's progress claim. Only a literal successful
+verification continues the SAME asset in another revision, without freezing or
+grading the incomplete family. Checkpoints, pending work and the original
+reviewer enrollments remain in history. Progress can never produce ACCEPT or
+advance an asset; missing proof, reused identities or an ambiguous result wait.
+
 `retryProductionPreparation` is a narrow host-only reconciliation API for a
 completed, read-only preparation that returned BLOCKED. It requires the expected
 run ID, catalog hash and an audit reason, rechecks the original receipts under
