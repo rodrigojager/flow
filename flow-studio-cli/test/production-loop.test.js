@@ -978,3 +978,234 @@ for (const mode of ['producer uncertainty', 'read-only freeze BLOCKED', 'read-on
                 expectedRunId: before.pending.runId, expectedCatalogHash: before.catalogHash, reason: 'Not eligible despite this reason.' } });
     });
 }
+
+function syntheticEnrollment(role, args) {
+    return { role, invocationId: `${args.assetId}-enrollment-${role}-invocation`, sessionId: `${args.assetId}-enrollment-${role}-session`,
+        modelId: `synthetic/${role}`, scopeHash: hash('full scope'), rubricHash: hash('ten synthetic criteria'), ready: true, blockers: [],
+        metadata: { policy: 'Synthetic immutable full-scope policy, not an asset grade.', raw: JSON.parse('{"constructor":false,"__proto__":false}') } };
+}
+
+async function enrollmentFixture(t) {
+    const f = await fixture(t), prepare = f.options.adapters.prepare;
+    f.options.adapters.prepare = async args => {
+        const ready = await prepare(args);
+        return { ...ready, brief: { ...ready.brief, scopeHash: hash('full scope'), rubricHash: hash('ten synthetic criteria'), instructionsForRevision: args.revision } };
+    };
+    f.options.adapters.enrollReviewer = async (role, args) => {
+        assert.equal(args.readonly, true);
+        assert.equal(args.reviewerEnrollments, undefined, 'an enrollment cannot see or manufacture a validated pair');
+        const record = await f.store.get(args.runId);
+        const effect = record.effects.find(e => e.nodeId === (role === 'artistic' ? 'enrollArtistic' : 'enrollTechnical'));
+        assert.equal(effect.kind, 'read'); assert.equal(effect.status, 'started');
+        f.calls.push(`enroll:${role}:${args.assetId}:${args.revision}`);
+        return syntheticEnrollment(role, args);
+    };
+    f.options.adapters.review = async (role, args) => {
+        f.calls.push(`review:${role}:${args.assetId}:${args.revision}`);
+        assert.deepEqual(args.enrollment, args.reviewerEnrollments[role === 'artistic' ? 0 : 1]);
+        assert.equal(args.enrollment.metadata.raw.constructor, false, 'grading uses original host snapshots');
+        return { ...syntheticReview(role, args), enrollmentId: args.enrollment.invocationId, modelId: args.enrollment.modelId };
+    };
+    return f;
+}
+
+test('enrollment real Fork/Join completes two readonly invocations before any producer/freeze/Blender-style callback', { timeout: 15_000 }, async t => {
+    const f = await enrollmentFixture(t), started = deferred(), finish = deferred();
+    const enroll = f.options.adapters.enrollReviewer;
+    let active = 0, arrived = 0;
+    f.options.adapters.enrollReviewer = async (role, args) => {
+        active++;
+        const receipt = await enroll(role, args);
+        if (++arrived === 2) started.resolve();
+        await finish.promise;
+        active--;
+        return receipt;
+    };
+    for (const name of ['produce', 'freeze', 'verifyFrozen', 'review']) {
+        const callback = f.options.adapters[name];
+        f.options.adapters[name] = async (...args) => {
+            assert.equal(active, 0, 'no asset/Blender-style callback may overlap initial enrollment');
+            const invocation = name === 'review' ? args[1] : args[0];
+            assert.deepEqual(invocation.reviewerEnrollments.map(e => e.role), ['artistic', 'technical']);
+            assert.equal(invocation.enrollmentBrief.instructionsForRevision, 1);
+            return callback(...args);
+        };
+    }
+    const running = runProductionQueue({ ...f.options, maxAssetsPerSession: 1 });
+    try {
+        await Promise.race([started.promise, running.then(state => assert.fail(JSON.stringify(state.reasons)))]);
+        assert.equal(active, 2);
+        assert.equal(f.calls.some(c => /^(produce|freeze|verify|review):/.test(c)), false);
+        await assert.rejects(fs.access(f.artifact), { code: 'ENOENT' });
+    } finally { finish.resolve(); }
+    const state = await running;
+    assert.equal(state.status, 'PAUSED', JSON.stringify(state.reasons)); assert.equal(state.current, 1);
+    const output = state.history[0].outputs, record = await f.store.get(state.runIds[0]);
+    assert.equal(validateFlowStudioGraph(record.graph).valid, true);
+    assert.equal(record.graph.nodes.find(n => n.id === 'enrollmentJoined').join.strategy, 'all');
+    assert.equal(record.events.filter(e => e.kind === 'branch.started').length, 4, 'two initial enrollments plus two actual grades');
+    assert.equal(output.enrollment.ok, true); assert.equal(output.enrollment.sourceRunId, record.id);
+    assert.deepEqual(output.enrollment.reviewerEnrollments, [output.enrollArtistic, output.enrollTechnical]);
+    assert.equal(output.enrollArtistic.total, undefined); assert.equal(output.enrollArtistic.status, undefined);
+    for (const id of ['enrollArtistic', 'enrollTechnical', 'enrollment']) {
+        assert.equal(record.effects.find(e => e.nodeId === id).kind, 'read');
+        assert.ok(record.result.visited.indexOf(id) < record.result.visited.indexOf('produce'));
+    }
+    assert.notEqual(output.artistic.assignment.sessionId, output.enrollArtistic.sessionId);
+    assert.equal(output.artistic.enrollmentId, output.enrollArtistic.invocationId);
+});
+
+test('enrollment is reused across revision sessions with original policy, full history and fresh grades; next asset enrolls separately', async t => {
+    const f = await enrollmentFixture(t), review = f.options.adapters.review;
+    f.options.adapters.review = async (role, args) => {
+        if (args.assetId === 'a' && args.revision === 2) {
+            assert.equal(args.enrollmentBrief.instructionsForRevision, 1);
+            assert.deepEqual(args.unresolvedByRole.artistic, ['initial-finding']);
+            assert.equal(args.history[0].outputs.artistic.assignment.output.total, 99);
+        }
+        const value = await review(role, args);
+        if (args.assetId === 'a' && args.revision === 1 && role === 'artistic') {
+            value.assignment.output.criteria[0].score = 9; value.assignment.output.total = 99;
+            value.assignment.output.improvements = [{ id: 'initial-finding', criterionId: 'C1', justification: 'Synthetic finding.', evidenceIds: ['view-all'] }];
+        }
+        return value;
+    };
+    const first = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    assert.equal(first.status, 'PAUSED'); assert.equal(first.current, 0); assert.equal(first.revision, 2);
+    const state = await runProductionQueue(f.options);
+    assert.equal(state.status, 'COMPLETED', JSON.stringify(state.reasons));
+    assert.deepEqual(state.history.map(h => h.result.verdict), ['REVISE', 'ACCEPT', 'ACCEPT']);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('enroll')).sort(), ['enroll:artistic:a:1', 'enroll:artistic:b:1', 'enroll:technical:a:1', 'enroll:technical:b:1']);
+    assert.deepEqual(state.history[1].outputs.enrollArtistic, first.history[0].outputs.enrollArtistic);
+    assert.deepEqual(state.history[1].outputs.enrollTechnical, first.history[0].outputs.enrollTechnical);
+    assert.equal(state.history[1].outputs.enrollment.sourceRunId, first.runIds[0]);
+    assert.notEqual(state.history[1].outputs.artistic.assignment.sessionId, first.history[0].outputs.artistic.assignment.sessionId);
+    assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1', 'produce:a:2', 'produce:b:1']);
+});
+
+for (const mode of ['missing', 'duplicate session', 'duplicate invocation', 'wrong role', 'wrong scope', 'wrong rubric', 'missing model',
+    'not ready', 'fake ready', 'blockers', 'malformed blockers', 'fake PASS', 'raw constructor', 'exception']) {
+    test(`enrollment ${mode} pauses before producer; removing callback or preparation recovery cannot bypass`, async t => {
+        const f = await enrollmentFixture(t);
+        f.options.adapters.enrollReviewer = async (role, args) => {
+            f.calls.push(`enroll:${role}`);
+            const value = syntheticEnrollment(role, args);
+            if (role === 'technical') {
+                if (mode === 'missing') return null;
+                if (mode === 'duplicate session') value.sessionId = syntheticEnrollment('artistic', args).sessionId;
+                if (mode === 'duplicate invocation') value.invocationId = syntheticEnrollment('artistic', args).invocationId;
+                if (mode === 'wrong role') value.role = 'artistic';
+                if (mode === 'wrong scope') value.scopeHash = hash('different scope');
+                if (mode === 'wrong rubric') value.rubricHash = hash('different rubric');
+                if (mode === 'missing model') delete value.modelId;
+                if (mode === 'not ready') value.ready = false;
+                if (mode === 'fake ready') value.ready = 'true';
+                if (mode === 'blockers') value.blockers = ['Synthetic enrollment blocked.'];
+                if (mode === 'malformed blockers') value.blockers = [''];
+                if (mode === 'fake PASS') { value.status = 'PASS'; value.total = 100; }
+                if (mode === 'raw constructor') Object.defineProperty(value, 'constructor', { value: false, enumerable: true });
+                if (mode === 'exception') throw new Error('Synthetic enrollment response lost.');
+            }
+            return value;
+        };
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0); assert.equal(state.revision, 1);
+        assert.deepEqual(state.approvals, []); assert.equal(f.calls.some(c => /^(produce|freeze|verify|review):/.test(c)), false);
+        const count = f.calls.length;
+        await runProductionQueue({ ...f.options, adapters: { ...f.options.adapters, enrollReviewer: undefined } });
+        assert.equal(f.calls.length, count);
+        await assert.rejects(retryProductionPreparation({ stateDir: f.options.stateDir, expectedRunId: state.pending.runId,
+            expectedCatalogHash: state.catalogHash, reason: 'Cannot bypass initial enrollment checks.' }));
+        assert.equal(state.history[0].outputs.finalize, undefined, 'initial enrollment is not a grade');
+        if (mode === 'raw constructor') assert.equal(Object.hasOwn(state.history[0].outputs.enrollTechnical, 'constructor'), true);
+    });
+}
+
+for (const mode of ['scope', 'rubric', 'opaque brief', 'unverified origin', 'changed origin tuple']) {
+    test(`enrollment ${mode} change never triggers a new setup or releases the next producer`, async t => {
+        const f = await enrollmentFixture(t), prepare = f.options.adapters.prepare;
+        if (mode === 'opaque brief') f.options.adapters.prepare = async () => ({ status: 'READY', brief: 'Synthetic immutable opaque policy.' });
+        f.options.adapters.freeze = async () => ({ status: 'REVISE', reasons: ['Synthetic import correction.'] });
+        const first = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+        assert.equal(first.status, 'PAUSED'); assert.equal(first.revision, 2);
+        if (mode === 'scope' || mode === 'rubric') f.options.adapters.prepare = async args => {
+            const value = await prepare(args); value.brief[`${mode}Hash`] = hash('changed policy'); return value;
+        };
+        if (mode === 'opaque brief') f.options.adapters.prepare = async () => ({ status: 'READY', brief: 'Changed opaque policy.' });
+        if (mode === 'unverified origin' || mode === 'changed origin tuple') {
+            const changed = await f.state();
+            if (mode === 'unverified origin') changed.history[0].outputs.enrollment.ok = false;
+            else changed.history[0].outputs.enrollment.reviewerEnrollments[0].modelId = 'different-model';
+            await fs.writeFile(path.join(f.options.stateDir, 'queue.json'), JSON.stringify(changed));
+        }
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0); assert.equal(state.revision, 2);
+        assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 2, 'first pair is never replaced');
+        assert.deepEqual(f.calls.filter(c => c.startsWith('produce')), ['produce:a:1']);
+    });
+}
+
+for (const mode of ['missing enrollment ID', 'wrong enrollment ID', 'wrong model', 'reused initial session', 'reused initial invocation', 'producer reused enrollment', 'frozen scope drift']) {
+    test(`enrollment grading rejects ${mode} without creating an approval`, async t => {
+        const f = await enrollmentFixture(t), review = f.options.adapters.review, produce = f.options.adapters.produce, freeze = f.options.adapters.freeze;
+        f.options.adapters.produce = async args => {
+            const receipt = await produce(args);
+            if (mode === 'producer reused enrollment') receipt.sessionId = args.reviewerEnrollments[0].sessionId;
+            return receipt;
+        };
+        f.options.adapters.freeze = async args => {
+            const frozen = await freeze(args);
+            if (mode === 'frozen scope drift') frozen.manifest.scopeHash = hash('drifted frozen scope');
+            return frozen;
+        };
+        f.options.adapters.review = async (role, args) => {
+            const value = await review(role, args);
+            if (mode === 'missing enrollment ID') delete value.enrollmentId;
+            if (mode === 'wrong enrollment ID') value.enrollmentId = 'other-enrollment';
+            if (mode === 'wrong model') value.modelId = 'other/model';
+            if (mode === 'reused initial session') value.assignment.sessionId = value.visualReceipt.sessionId = args.enrollment.sessionId;
+            if (mode === 'reused initial invocation') value.assignment.invocationId = value.visualReceipt.invocationId = args.enrollment.invocationId;
+            return value;
+        };
+        const state = await runProductionQueue(f.options);
+        assert.equal(state.status, 'WAITING'); assert.equal(state.current, 0); assert.deepEqual(state.approvals, []);
+        assert.equal(f.calls.filter(c => c.startsWith('produce')).length, 1);
+        if (mode === 'producer reused enrollment' || mode === 'frozen scope drift') assert.equal(f.calls.some(c => c.startsWith('review')), false);
+    });
+}
+
+test('enrollment optional class callback binds private this; prepare BLOCKED recovery still uses the old readonly-only path', async t => {
+    const f = await enrollmentFixture(t), delegate = f.options.adapters, enroll = delegate.enrollReviewer, prepare = delegate.prepare;
+    let blocked = true;
+    class EnrollingAdapters {
+        #enroll = enroll;
+        prepare = async args => blocked ? { status: 'BLOCKED', reasons: ['Synthetic incomplete brief.'] } : prepare(args);
+        produce = delegate.produce;
+        freeze = delegate.freeze;
+        verifyFrozen = delegate.verifyFrozen;
+        review = delegate.review;
+        enrollReviewer(role, args) { return this.#enroll(role, args); }
+    }
+    const options = { ...f.options, adapters: new EnrollingAdapters(), maxAssetsPerSession: 1 };
+    const waiting = await runProductionQueue(options);
+    assert.equal(waiting.status, 'WAITING'); assert.deepEqual(f.calls, []);
+    assert.deepEqual((await f.store.get(waiting.pending.runId)).result.visited, ['prepare', 'ready', 'wait']);
+    await retryProductionPreparation({ stateDir: options.stateDir, expectedRunId: waiting.pending.runId,
+        expectedCatalogHash: waiting.catalogHash, reason: 'Brief now contains the complete immutable policy.' });
+    blocked = false;
+    const state = await runProductionQueue(options);
+    assert.equal(state.current, 1, JSON.stringify(state.reasons));
+    assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 2);
+});
+
+test('enrollment callback cannot be removed mid-asset; stable opaque policy can reuse its first pair', async t => {
+    const f = await enrollmentFixture(t);
+    f.options.adapters.prepare = async () => ({ status: 'READY', brief: 'Synthetic complete opaque policy.' });
+    f.options.adapters.freeze = async () => ({ status: 'REVISE', reasons: ['Synthetic correctable import.'] });
+    const first = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    await assert.rejects(runProductionQueue({ ...f.options, adapters: { ...f.options.adapters, enrollReviewer: undefined } }), /removing the adapter/);
+    assert.deepEqual(await f.state(), first);
+    const next = await runProductionQueue({ ...f.options, maxRevisionsPerSession: 1 });
+    assert.equal(next.status, 'PAUSED'); assert.equal(next.revision, 3);
+    assert.equal(f.calls.filter(c => c.startsWith('enroll')).length, 2);
+});

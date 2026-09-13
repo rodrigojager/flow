@@ -174,6 +174,15 @@ WAIT or an ambiguous effect never silently advances or replays. Session budgets
 pause work without approving it. Locks are not stolen, including stale locks.
 The owner must explicitly reconcile interrupted work before resuming.
 
+Hosts that require reviewers initialized before modeling can supply the optional
+`enrollReviewer(role, args)` callback. The engine runs both read-only setup calls
+in a Fork/Join before the producer, validates distinct transport identities and
+the scope/rubric, and preserves the first validated pair across revisions.
+Setup receipts describe registered, idle reviewers, not asset grades or imaginary
+continuously running workers. Later grading uses fresh independent invocations
+linked to the original enrollment/model and complete role-specific history.
+Removing enrollment after it has been enabled cannot bypass that contract.
+
 `retryProductionPreparation` is a narrow host-only reconciliation API for a
 completed, read-only preparation that returned BLOCKED. It requires the expected
 run ID, catalog hash and an audit reason, rechecks the original receipts under

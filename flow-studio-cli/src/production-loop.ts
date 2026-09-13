@@ -22,14 +22,34 @@ export interface ProductionFrozen {
 }
 /** Trusted host classification of a completed, correctable failure, never raw model output. */
 export interface ProductionCorrection { status: 'REVISE'; reasons: string[]; [key: string]: unknown }
+/** Host transport receipt for a real read-only policy enrollment, NOT an asset grade. */
+export interface ProductionReviewerEnrollment {
+    role: ProductionReviewerRole;
+    invocationId: string;
+    sessionId: string;
+    modelId: string;
+    scopeHash: string;
+    rubricHash: string;
+    ready: boolean;
+    blockers: string[];
+    metadata?: Record<string, unknown>;
+}
+/** Fixed order: artistic, technical. Enrollment IDs are the original invocationIds. */
+export type ProductionReviewerEnrollments = [ProductionReviewerEnrollment, ProductionReviewerEnrollment];
 export interface ProductionJudgeReview {
     assignment: TrustedProductionReviewerAssignment;
     visualReceipt: VerifiedProductionVisualReceipt;
+    /** Required with enrollment enabled; trusted transport metadata, not model echoes. */
+    enrollmentId?: string;
+    modelId?: string;
     [key: string]: unknown;
 }
 type Outstanding = Record<ProductionReviewerRole, string[]>;
 export interface ProductionRevisionOutputs {
     prepare?: ProductionPreparation;
+    enrollArtistic?: ProductionReviewerEnrollment;
+    enrollTechnical?: ProductionReviewerEnrollment;
+    enrollment?: { ok: boolean; reasons: string[]; briefPolicyHash: string; sourceRunId: string; reviewerEnrollments?: ProductionReviewerEnrollments };
     produce?: ProductionReceipt;
     freeze?: ProductionFrozen | ProductionCorrection;
     verify?: { ok: boolean; reasons: string[]; correction?: true };
@@ -55,13 +75,17 @@ export interface ProductionQueueState {
 export interface ProductionInvocation {
     entry: ProductionCatalogEntry; assetId: string; revision: number; idempotencyKey: string;
     runId: string; signal: AbortSignal; history: ProductionRevisionHistory[]; unresolvedByRole: Outstanding;
+    reviewerEnrollments?: ProductionReviewerEnrollments;
+    /** Original enrollment brief, unchanged even if later revision instructions change. */
+    enrollmentBrief?: unknown;
 }
 export interface ProductionAdapters {
     prepare(args: ProductionInvocation): Promise<ProductionPreparation>;
+    enrollReviewer?(role: ProductionReviewerRole, args: ProductionInvocation & { brief: unknown; readonly: true }): Promise<ProductionReviewerEnrollment>;
     produce(args: ProductionInvocation & { brief: unknown }): Promise<ProductionReceipt>;
     freeze(args: ProductionInvocation & { brief: unknown; receipt: ProductionReceipt }): Promise<ProductionFrozen | ProductionCorrection>;
     verifyFrozen(args: ProductionInvocation & { frozen: ProductionFrozen; phase: 'before-review' | 'before-approval' }): Promise<boolean>;
-    review(role: ProductionReviewerRole, args: ProductionInvocation & { frozen: ProductionFrozen }): Promise<ProductionJudgeReview>;
+    review(role: ProductionReviewerRole, args: ProductionInvocation & { frozen: ProductionFrozen; enrollment?: ProductionReviewerEnrollment }): Promise<ProductionJudgeReview>;
     freezeEffect?: 'read' | 'command';
     /** Default read. Network invocations require an explicit host-enforced endpoint. */
     reviewEffect?: 'read' | 'network';
@@ -209,6 +233,13 @@ export async function retryProductionPreparation(options: ProductionPreparationR
  * cannot sandbox JS, terminate an external agent, or enforce filesystem ACLs.
  * WAIT/pending never retries or replays. Reconciliation is explicitly host-owned.
  * PAUSED budgets may continue by calling again with the identical catalog.
+ * Optional enrollReviewer must run independent read-only agents with no Blender
+ * access or asset/control writes. Ready enrollments become idle policy receipts,
+ * not long-lived/busy subprocesses. Later grades use fresh sessions, pinned models,
+ * the original enrollmentBrief/metadata, enrollmentId and full asset history.
+ * The first validated pair is reused, never replaced to seek favorable opinions.
+ * Without both brief.scopeHash/rubricHash, the whole opaque brief is policy-bound
+ * and must stay unchanged across revisions; frozen scope/rubric must still match.
  * Existing locks, even stale/malformed ones, are rejected: verify the owner PID
  * and reconcile pending effects before explicit offline recovery. No lock stealing.
  */
@@ -217,9 +248,11 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
     for (const method of ['prepare', 'produce', 'freeze', 'verifyFrozen', 'review'] as const) {
         if (typeof source?.[method] !== 'function') throw new Error(`Production adapter ${method} must be a function.`);
     }
+    if (source.enrollReviewer !== undefined && typeof source.enrollReviewer !== 'function') throw new Error('Production adapter enrollReviewer must be a function.');
     const host: ProductionAdapters = {
         prepare: source.prepare.bind(source), produce: source.produce.bind(source), freeze: source.freeze.bind(source),
         verifyFrozen: source.verifyFrozen.bind(source), review: source.review.bind(source),
+        enrollReviewer: source.enrollReviewer?.bind(source),
         freezeEffect: source.freezeEffect, reviewEffect: source.reviewEffect, reviewEndpoint: source.reviewEndpoint
     };
     const limit = options.maxRevisionsPerSession, assets = options.maxAssetsPerSession ?? Number.MAX_SAFE_INTEGER;
@@ -267,6 +300,8 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
             const entry = queue[state.current], revision = state.revision;
             const key = `production:${catalogHash}:${hash(entry.id)}:${revision}`;
             const history = copy(state.history.filter(item => item.assetId === entry.id));
+            const enrollmentOrigin = history.find(h => ['enrollArtistic', 'enrollTechnical', 'enrollment'].some(k => Object.hasOwn(h.outputs, k)));
+            if (enrollmentOrigin && !host.enrollReviewer) throw new Error('This asset already requires reviewer enrollment; removing the adapter cannot bypass it.');
             const unresolved = copy(state.unresolvedByRole), outputs: ProductionRevisionOutputs = {};
             state.pending = { token: randomUUID(), entry: copy(entry), revision, idempotencyKey: key };
             state.status = 'RUNNING'; state.reasons = [];
@@ -293,7 +328,10 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                         // Engine context merges remove constructor/prototype/__proto__.
                         // Host callbacks and strict policy must consume the original snapshots.
                         const value = await fn({ ...copy({ entry, assetId: entry.id, revision, idempotencyKey: key,
-                            history, unresolvedByRole: unresolved }), runId: args.runId, signal: args.signal! }, copy(outputs));
+                            history, unresolvedByRole: unresolved, ...(outputs.enrollment?.ok ? {
+                                reviewerEnrollments: outputs.enrollment.reviewerEnrollments,
+                                enrollmentBrief: ((enrollmentOrigin?.outputs.prepare ?? outputs.prepare) as { brief: unknown }).brief
+                            } : {}) }), runId: args.runId, signal: args.signal! }, copy(outputs));
                         args.signal!.throwIfAborted();
                         const saved = copy(value);
                         Object.assign(outputs, { [id]: saved });
@@ -312,7 +350,31 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                 }
                 return value;
             });
-            bind('produce', (args, raw) => host.produce({ ...args, brief: (raw.prepare as { brief: unknown }).brief }));
+            if (host.enrollReviewer) {
+                for (const [id, role] of [['enrollArtistic', 'artistic'], ['enrollTechnical', 'technical']] as const) {
+                    bind(id, (args, raw) => enrollmentOrigin
+                        ? Promise.resolve(enrollmentOrigin.outputs[id])
+                        : host.enrollReviewer!(role, { ...args, brief: (raw.prepare as { brief: unknown }).brief, readonly: true }));
+                }
+                bind('enrollment', async (args, raw) => {
+                    const checked = validateReviewerEnrollments((raw.prepare as { brief: unknown }).brief,
+                        [raw.enrollArtistic, raw.enrollTechnical], enrollmentOrigin);
+                    if (!enrollmentOrigin) {
+                        const prior = state.history.flatMap(h => [h.outputs.produce, h.outputs.artistic?.assignment, h.outputs.technical?.assignment,
+                            h.outputs.enrollArtistic, h.outputs.enrollTechnical]);
+                        if ([raw.enrollArtistic, raw.enrollTechnical].some(e => e && prior.some(p => p
+                            && (p.sessionId === e.sessionId || p.invocationId === e.invocationId)))) {
+                            checked.ok = false; checked.reasons.push('Enrollment requires distinct new invocation/session IDs.');
+                            delete checked.reviewerEnrollments;
+                        }
+                    }
+                    return { ...checked, sourceRunId: enrollmentOrigin?.runId ?? args.runId };
+                });
+            }
+            bind('produce', (args, raw) => {
+                if (host.enrollReviewer && (!raw.enrollment?.ok || !args.reviewerEnrollments)) throw new Error('Both reviewer enrollments must be verified before production.');
+                return host.produce({ ...args, brief: (raw.prepare as { brief: unknown }).brief });
+            });
             bind('freeze', (args, raw) => host.freeze({ ...args, brief: (raw.prepare as { brief: unknown }).brief, receipt: raw.produce! }));
             bind('verify', async (args, raw) => {
                 const f = raw.freeze, p = raw.produce;
@@ -321,13 +383,17 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                 const bound = !!f?.manifest && f.manifest.assetId === entry.id && f.manifest.revision === revision
                     && f.visualProbePassed === true
                     && !!p?.invocationId?.trim() && !!p?.sessionId?.trim()
-                    && f.manifest.producerInvocationId === p.invocationId && f.producerSessionId === p.sessionId;
+                    && f.manifest.producerInvocationId === p.invocationId && f.producerSessionId === p.sessionId
+                    && (!host.enrollReviewer || (raw.enrollment?.ok === true && args.reviewerEnrollments?.every(e =>
+                        e.scopeHash === f.manifest.scopeHash && e.rubricHash === f.manifest.rubricHash
+                        && e.invocationId !== p.invocationId && e.sessionId !== p.sessionId)));
                 const ok = bound && await host.verifyFrozen({ ...args, frozen: copy(f!), phase: 'before-review' }) === true;
                 return { ok, reasons: ok ? [] : ['Frozen manifest binding or pre-review verification failed.'] };
             });
             for (const role of ['artistic', 'technical'] as const) bind(role, (args, raw) => {
                 if (!raw.freeze || isProductionCorrection(raw.freeze)) throw new Error('Review requires a frozen candidate, not a correction.');
-                return host.review(role, { ...args, frozen: raw.freeze });
+                return host.review(role, { ...args, frozen: raw.freeze,
+                    ...(args.reviewerEnrollments ? { enrollment: args.reviewerEnrollments[role === 'artistic' ? 0 : 1] } : {}) });
             });
             bind('finalize', async (args, raw) => {
                 const frozen = raw.freeze!, reviews = [raw.artistic!, raw.technical!];
@@ -338,10 +404,15 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
                 const result = validateProductionReview({ manifest: frozen.manifest, producerSessionId: frozen.producerSessionId,
                     visualProbePassed: frozen.visualProbePassed, reviewers: reviews.map(r => r?.assignment),
                     verifiedVisualReceipts: reviews.map(r => r?.visualReceipt), unresolvedByRole: unresolved });
-                const prior = state.history.flatMap(item => [item.outputs.artistic?.assignment, item.outputs.technical?.assignment, item.outputs.produce]);
+                const prior = [...state.history.flatMap(item => [item.outputs.artistic?.assignment, item.outputs.technical?.assignment, item.outputs.produce,
+                    item.outputs.enrollArtistic, item.outputs.enrollTechnical]), ...(args.reviewerEnrollments ?? [])];
                 if (reviews.some((r, i) => r?.assignment?.role !== (i === 0 ? 'artistic' : 'technical')
                     || prior.some(p => p && (p.sessionId === r?.assignment?.sessionId || p.invocationId === r?.assignment?.invocationId)))) {
                     return { verdict: 'WAIT', reasons: [...result.reasons, 'Reviewer role mismatch or reused invocation/session.'] };
+                }
+                if (host.enrollReviewer && (!raw.enrollment?.ok || !args.reviewerEnrollments
+                    || reviews.some((r, i) => r?.enrollmentId !== args.reviewerEnrollments![i].invocationId || r?.modelId !== args.reviewerEnrollments![i].modelId))) {
+                    return { verdict: 'WAIT', reasons: [...result.reasons, 'Grade must bind to the original reviewer enrollment and pinned model.'] };
                 }
                 return result;
             });
@@ -369,7 +440,8 @@ export async function runProductionQueue(options: ProductionQueueOptions): Promi
             const ambiguous = record?.effects.some(e => e.status === 'uncertain' || e.status === 'started');
             const reasons = failure ? [failure] : interrupted ? ['Revision timed out or cancelled; reconcile effects.']
                 : record?.error ? [record.error] : outputs.prepare?.status === 'BLOCKED' ? outputs.prepare.reasons
-                    : outputs.verify?.ok === false ? outputs.verify.reasons : outputs.finalize?.reasons ?? [];
+                    : outputs.enrollment?.ok === false ? outputs.enrollment.reasons
+                        : outputs.verify?.ok === false ? outputs.verify.reasons : outputs.finalize?.reasons ?? [];
             const result: ProductionReviewResult = !failure && !interrupted && !ambiguous && record?.status === 'completed' && outputs.finalize
                 ? copy(outputs.finalize) : { verdict: 'WAIT', reasons: reasons.length ? [...reasons] : ['Revision did not complete; reconcile effects.'] };
             state.history.push(copy({ assetId: entry.id, revision, runId, checkpointId: record?.result?.waiting?.checkpointId
@@ -411,9 +483,17 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
         version: 'flow-studio/v2', id: 'production-revision', name: 'One frozen production revision', start: 'prepare',
         permissions: { allow: ['tool:read', 'tool:command', 'tool:network'],
             networkHosts: host.reviewEffect === 'network' ? [new URL(host.reviewEndpoint!).hostname] : undefined,
-            commandPatterns: ['host:prepare', 'host:produce', 'host:freeze', 'host:verify', 'host:artistic', 'host:technical', 'host:finalize'] },
-        budget: { maxSteps: 24, maxDurationMs: timeoutMs, maxParallelism: 2 },
+            commandPatterns: ['host:prepare', 'host:produce', 'host:freeze', 'host:verify', 'host:artistic', 'host:technical', 'host:finalize',
+                ...(host.enrollReviewer ? ['host:enrollArtistic', 'host:enrollTechnical', 'host:enrollment'] : [])] },
+        budget: { maxSteps: host.enrollReviewer ? 32 : 24, maxDurationMs: timeoutMs, maxParallelism: 2 },
         nodes: [action('prepare', 'read', 'ready'), { id: 'ready', type: 'router', label: 'Ready?' },
+            ...(host.enrollReviewer ? [
+                { id: 'enrollmentFork', type: 'fork', label: 'Initial read-only policy enrollment',
+                    fork: { branches: ['enrollArtistic', 'enrollTechnical'], join: 'enrollmentJoined', maxConcurrency: 2 } },
+                action('enrollArtistic', 'read', 'enrollmentJoined'), action('enrollTechnical', 'read', 'enrollmentJoined'),
+                { id: 'enrollmentJoined', type: 'join', label: 'Both enrollments', join: { strategy: 'all' }, next: 'enrollment' },
+                action('enrollment', 'read', 'enrollmentReady'), { id: 'enrollmentReady', type: 'router', label: 'Both enrolled and policy-bound?' }
+            ] satisfies FlowStudioNode[] : []),
             action('produce', 'command', 'freeze'), action('freeze', host.freezeEffect ?? 'command', 'verify'),
             action('verify', 'read', 'frozen'), { id: 'frozen', type: 'router', label: 'Verified freeze?' },
             { id: 'reviews', type: 'fork', label: 'Independent judges', fork: { branches: ['artistic', 'technical'], join: 'joined', maxConcurrency: 2 } },
@@ -423,7 +503,12 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
             { id: 'wait', type: 'wait', label: 'Host reconciliation', wait: { kind: 'event', eventName: 'production.reconciled' }, next: 'end' },
             { id: 'end', type: 'end', label: 'ACCEPT or REVISE' }],
         edges: [
-            { from: 'ready', to: 'produce', guard: 'context.prepare.status === "READY"', priority: 0 }, { from: 'ready', to: 'wait', priority: 1 },
+            { from: 'ready', to: host.enrollReviewer ? 'enrollmentFork' : 'produce', guard: 'context.prepare.status === "READY"', priority: 0 }, { from: 'ready', to: 'wait', priority: 1 },
+            ...(host.enrollReviewer ? [
+                { from: 'enrollArtistic', to: 'enrollmentJoined' }, { from: 'enrollTechnical', to: 'enrollmentJoined' },
+                { from: 'enrollmentReady', to: 'produce', guard: 'context.enrollment.ok === true', priority: 0 },
+                { from: 'enrollmentReady', to: 'wait', priority: 1 }
+            ] : []),
             { from: 'frozen', to: 'finalize', guard: 'context.verify.correction === true', priority: 0 },
             { from: 'frozen', to: 'reviews', guard: 'context.verify.ok === true', priority: 1 }, { from: 'frozen', to: 'wait', priority: 2 },
             { from: 'artistic', to: 'joined' }, { from: 'technical', to: 'joined' },
@@ -431,6 +516,46 @@ function revisionGraph(key: string, timeoutMs: number, host: ProductionAdapters)
             { from: 'decision', to: 'wait', priority: 1 }
         ]
     };
+}
+
+function validateReviewerEnrollments(brief: unknown, values: unknown[], previous?: ProductionRevisionHistory): Omit<NonNullable<ProductionRevisionOutputs['enrollment']>, 'sourceRunId'> {
+    const reasons: string[] = [], fields = ['role', 'invocationId', 'sessionId', 'modelId', 'scopeHash', 'rubricHash', 'ready', 'blockers'];
+    const text = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+    const policyHash = (value: unknown): string => value && typeof value === 'object' && Object.hasOwn(value, 'scopeHash') && Object.hasOwn(value, 'rubricHash')
+        ? hash({ scopeHash: (value as Record<string, unknown>).scopeHash, rubricHash: (value as Record<string, unknown>).rubricHash }) : hash(value);
+    const briefPolicyHash = policyHash(brief), pair = values as ProductionReviewerEnrollments;
+    for (const [i, role] of ['artistic', 'technical'].entries()) {
+        const e = pair[i];
+        if (!e || typeof e !== 'object' || Array.isArray(e) || fields.some(k => !Object.hasOwn(e, k))
+            || Object.keys(e).some(k => !fields.includes(k) && k !== 'metadata')) {
+            reasons.push(`${role} enrollment: missing or unexpected fields (no grades allowed).`); continue;
+        }
+        if (e.role !== role) reasons.push(`${role} enrollment: wrong role.`);
+        if (![e.invocationId, e.sessionId, e.modelId].every(text)) reasons.push(`${role} enrollment: trusted invocation/session/model IDs required.`);
+        for (const field of ['scopeHash', 'rubricHash'] as const) {
+            if (typeof e[field] !== 'string' || !/^[0-9a-f]{64}$/.test(e[field])) reasons.push(`${role} enrollment: invalid ${field}.`);
+            if (brief && typeof brief === 'object' && Object.hasOwn(brief, field) && e[field] !== (brief as Record<string, unknown>)[field]) {
+                reasons.push(`${role} enrollment: ${field} differs from the host brief.`);
+            }
+        }
+        if (e.ready !== true) reasons.push(`${role} enrollment: reviewer is not ready.`);
+        if (!Array.isArray(e.blockers) || !e.blockers.every(text)) reasons.push(`${role} enrollment: malformed blockers.`);
+        else if (e.blockers.length) reasons.push(...e.blockers.map(b => `${role} enrollment blocked: ${b}`));
+        if (Object.hasOwn(e, 'metadata') && (!e.metadata || typeof e.metadata !== 'object' || Array.isArray(e.metadata))) reasons.push(`${role} enrollment: malformed metadata.`);
+    }
+    if (pair[0] && pair[1]) {
+        if (pair[0].invocationId === pair[1].invocationId || pair[0].sessionId === pair[1].sessionId) reasons.push('Reviewer enrollments require independent invocation/session IDs.');
+        if (pair[0].scopeHash !== pair[1].scopeHash || pair[0].rubricHash !== pair[1].rubricHash) reasons.push('Reviewer enrollments must share the same scope and rubric.');
+    }
+    if (previous) {
+        const stored = previous.outputs.enrollment, prepared = previous.outputs.prepare;
+        if (stored?.ok !== true || !text(previous.runId) || stored.sourceRunId !== previous.runId || prepared?.status !== 'READY'
+            || stored.briefPolicyHash !== policyHash(prepared.brief)
+            || !isDeepStrictEqual([previous.outputs.enrollArtistic, previous.outputs.enrollTechnical], stored.reviewerEnrollments)
+            || !isDeepStrictEqual(pair, stored.reviewerEnrollments)) reasons.push('First enrollment is unverified or changed; cannot replace it with a new opinion.');
+        if (stored?.briefPolicyHash !== briefPolicyHash) reasons.push('Enrollment scope/rubric policy changed; new setup is not automatic.');
+    }
+    return { ok: reasons.length === 0, reasons, briefPolicyHash, ...(reasons.length ? {} : { reviewerEnrollments: copy(pair) }) };
 }
 
 function isProductionCorrection(value: unknown): value is ProductionCorrection {
