@@ -19,7 +19,7 @@
     "clean": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -b tsconfig.json --force",
     "compile": "npm run build",
-    "test": "npm run build && node --test test/flow-studio-engine.test.js",
+    "test": "npm run build && node --test test/*.test.js",
     "watch": "npx tsc -p tsconfig.json --watch --preserveWatchOutput"
   },
   "files": [

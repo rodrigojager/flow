@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import * as path from 'node:path';
 import type {
     FlowStudioAuthorResult,
@@ -14,6 +14,8 @@ import type {
 } from '@cybervinci/flow-shared';
 
 export interface FlowStudioControllerOptions {
+    /** Host-only absolute Node/Bun executable path; never sourced from a graph or tool arguments. */
+    runtimePath?: string;
     host?: string;
     port?: number;
     workspace?: string;
@@ -86,6 +88,7 @@ export class FlowStudioController {
         assertInsideWorkspace(workspace, graph);
         const host = options.host || DEFAULT_HOST;
         if (!isLoopback(host)) throw new Error('O controlador OpenCode só inicia o Studio em loopback.');
+        const runtime = resolveRuntime(options.runtimePath);
         const port = options.port || await reservePort(host);
         const token = options.token || randomBytes(24).toString('base64url');
         const cliScript = createRequire(import.meta.url).resolve('@cybervinci/flow/lib/index.js');
@@ -105,18 +108,23 @@ export class FlowStudioController {
         if (options.allowGraphRunners) args.push('--allow-graph-runners');
         if (options.simulate) args.push('--simulate');
 
-        const child = spawn(process.execPath, args, {
+        const childFailure = new AbortController();
+        const child = spawn(runtime, args, {
             cwd: workspace,
             env: process.env,
             stdio: ['ignore', 'pipe', 'pipe'],
             windowsHide: true
         });
-        if (!child.pid) throw new Error('Não foi possível iniciar o Flow Studio CLI.');
+        child.on('error', (error: NodeJS.ErrnoException) => {
+            // Native spawn errors can include spawnargs (and the token); expose only the error code.
+            childFailure.abort(new Error(`Não foi possível iniciar o Flow Studio CLI${error.code ? ` (${error.code})` : ''}.`));
+        });
         let stderr = '';
         child.stderr?.on('data', chunk => { stderr = `${stderr}${String(chunk)}`.slice(-16_384); });
         const baseUrl = `http://${host}:${port}`;
         try {
-            await waitForHealth(baseUrl, token, child, () => stderr, options.signal);
+            await waitForHealth(baseUrl, token, child, () => stderr, childFailure.signal, options.signal);
+            if (!child.pid) throw new Error('Não foi possível iniciar o Flow Studio CLI.');
         } catch (error) {
             await stopChild(child);
             throw error;
@@ -278,10 +286,57 @@ function parseArgs(argv: string[]): { positionals: string[]; values: Map<string,
 }
 
 function forwardToCli(argv: string[]): number {
+    const runtime = resolveRuntime();
     const cliScript = createRequire(import.meta.url).resolve('@cybervinci/flow/lib/index.js');
-    const result = spawnSync(process.execPath, [cliScript, ...argv], { stdio: 'inherit', windowsHide: true });
+    const result = spawnSync(runtime, [cliScript, ...argv], { stdio: 'inherit', windowsHide: true });
     if (result.error) throw result.error;
     return result.status ?? 1;
+}
+
+function resolveRuntime(runtimePath: string | undefined = process.env.FLOW_STUDIO_RUNTIME_PATH): string {
+    const explicit = runtimePath !== undefined;
+    if (explicit && (typeof runtimePath !== 'string' || !path.isAbsolute(runtimePath)
+        || runtimePath.includes('\0') || (process.platform === 'win32' && path.extname(runtimePath).toLowerCase() !== '.exe'))) {
+        throw new Error('runtimePath / FLOW_STUDIO_RUNTIME_PATH must be an absolute Node/Bun executable path, without arguments.');
+    }
+    const candidates: string[] = explicit ? [runtimePath!] : [];
+    // A compiled Bun/Node application is not a JavaScript interpreter, even if it exposes process.versions.
+    if (!explicit) {
+        if (/^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath))) candidates.push(process.execPath);
+        const searchPath = Object.entries(process.env).find(([key]) => process.platform === 'win32' ? key.toLowerCase() === 'path' : key === 'PATH')?.[1];
+        for (const entry of (searchPath || '').split(path.delimiter)) {
+            const directory = process.platform === 'win32' ? entry.replace(/^"(.*)"$/, '$1') : entry;
+            // Never let Windows resolve a bare command from the graph workspace or a relative PATH entry.
+            if (!path.isAbsolute(directory)) continue;
+            const candidate = path.join(directory, process.platform === 'win32' ? 'node.exe' : 'node');
+            try {
+                if (statSync(candidate).isFile()) {
+                    candidates.push(candidate);
+                    break;
+                }
+            } catch { /* not an installed runtime */ }
+        }
+    }
+    for (const candidate of new Set(candidates)) {
+        try {
+            if (!statSync(candidate).isFile()) continue;
+            const marker = `flow-runtime-${randomBytes(16).toString('hex')}`;
+            const result = spawnSync(candidate, ['--eval', `if (process.versions.node || process.versions.bun) process.stdout.write(${JSON.stringify(marker)})`], {
+                cwd: path.dirname(candidate),
+                stdio: ['ignore', 'pipe', 'pipe'],
+                encoding: 'utf8',
+                windowsHide: true,
+                shell: false,
+                timeout: 1_500,
+                killSignal: 'SIGKILL',
+                maxBuffer: 4_096
+            });
+            if (!result.error && result.status === 0 && result.signal === null && result.stdout === marker) return candidate;
+        } catch { /* fail closed without exposing probe output or host secrets */ }
+    }
+    throw new Error(explicit
+        ? 'Invalid Node/Bun runtime in runtimePath / FLOW_STUDIO_RUNTIME_PATH; no fallback attempted.'
+        : 'No valid JavaScript runtime found. Install Node on PATH or set the host runtimePath / FLOW_STUDIO_RUNTIME_PATH to an absolute Node/Bun executable path.');
 }
 
 function appendOption(args: string[], key: string, value: string | number | undefined): void {
@@ -300,22 +355,28 @@ async function reservePort(host: string): Promise<number> {
     });
 }
 
-async function waitForHealth(baseUrl: string, token: string, child: ChildProcess, readStderr: () => string, signal?: AbortSignal): Promise<void> {
+async function waitForHealth(baseUrl: string, token: string, child: ChildProcess, readStderr: () => string, childFailure: AbortSignal, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-    while (Date.now() < deadline) {
+    const startupSignal = signal ? AbortSignal.any([signal, childFailure]) : childFailure;
+    while (true) {
         if (signal?.aborted) throw new Error('Inicialização do Flow Studio cancelada.');
+        childFailure.throwIfAborted();
         if (child.exitCode !== null) throw new Error(`Flow Studio encerrou durante a inicialização. ${readStderr()}`.trim());
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const requestSignal = AbortSignal.any([startupSignal, AbortSignal.timeout(remaining)]);
         try {
-            const response = await fetch(`${baseUrl}/api/health`, { headers: { 'X-Flow-Studio-Token': token }, signal });
-            if (response.ok) return;
+            const response = await fetch(`${baseUrl}/api/health`, { headers: { 'X-Flow-Studio-Token': token }, signal: requestSignal });
+            await response.body?.cancel();
+            if (response.ok && !requestSignal.aborted && child.exitCode === null && Date.now() < deadline) return;
         } catch { /* servidor ainda inicializando */ }
-        await new Promise(resolve => setTimeout(resolve, 100));
+        if (!startupSignal.aborted) await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(100, deadline - Date.now()))));
     }
     throw new Error(`Flow Studio não respondeu em ${baseUrl}. ${readStderr()}`.trim());
 }
 
 async function stopChild(child: ChildProcess): Promise<void> {
-    if (child.exitCode !== null) return;
+    if (!child.pid || child.exitCode !== null) return;
     child.kill('SIGTERM');
     await waitForChildExit(child, 3_000);
     if (child.exitCode === null) {
@@ -335,8 +396,24 @@ async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise
 function openBrowser(target: string): void {
     let executable: string;
     let args: string[];
+    let cwd: string | undefined;
     if (process.platform === 'win32') {
-        executable = 'rundll32.exe';
+        const systemRoot = process.env.SystemRoot;
+        if (!systemRoot || !/^[a-z]:[\\/]/i.test(systemRoot) || systemRoot.includes('\0')) {
+            throw new Error('Cannot open browser: SystemRoot must be a trusted absolute Windows directory.');
+        }
+        cwd = path.win32.join(systemRoot, 'System32');
+        executable = path.win32.join(cwd, 'rundll32.exe');
+        const library = path.win32.join(cwd, 'url.dll');
+        try {
+            // Reject missing files and reparse-point redirection; never search PATH or the workspace.
+            for (const file of [executable, library]) {
+                if (!statSync(file).isFile() || realpathSync(file).toLowerCase() !== file.toLowerCase()) throw new Error();
+            }
+        } catch {
+            throw new Error('Cannot open browser: verified SystemRoot\\System32 browser files are unavailable.');
+        }
+        // rundll32 parses module,entrypoint itself; its executable directory and cwd are both System32.
         args = ['url.dll,FileProtocolHandler', target];
     } else if (process.platform === 'darwin') {
         executable = 'open';
@@ -345,7 +422,8 @@ function openBrowser(target: string): void {
         executable = 'xdg-open';
         args = [target];
     }
-    const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    const child = spawn(executable, args, { cwd, detached: true, stdio: 'ignore', windowsHide: true, shell: false });
+    child.once('error', () => { /* browser launch is best-effort; do not crash the host or log its token URL */ });
     child.unref();
 }
 

@@ -192,8 +192,10 @@ const FlowStudioOpenCodePlugin: Plugin = async ({ client }, rawOptions) => {
 export default FlowStudioOpenCodePlugin;
 
 function normalizePluginOptions(options: Record<string, unknown> | undefined): Omit<FlowStudioControllerOptions, 'workspace' | 'signal' | 'openBrowser'> {
+    if (options?.runtimePath !== undefined && typeof options.runtimePath !== 'string') throw new Error('runtimePath must be an absolute Node/Bun executable path.');
     const strings = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : typeof value === 'string' ? [value] : undefined;
     return {
+        runtimePath: options?.runtimePath as string | undefined,
         provider: typeof options?.provider === 'string' ? options.provider : undefined,
         model: typeof options?.model === 'string' ? options.model : undefined,
         providerHost: options?.providerHost === 'flow' ? 'flow' : options?.providerHost === 'opencode' ? 'opencode' : options?.providerHost === 'cybervinci' ? 'cybervinci' : undefined,

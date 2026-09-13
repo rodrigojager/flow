@@ -143,3 +143,45 @@ e sessões quando instalados. Providers com autenticação ou protocolo especial
 (por exemplo, OAuth proprietário ou alguns serviços cloud) podem continuar usando
 esses adapters opcionais. `command`, MCP por comando e HTTP/worker autorizado
 continuam disponíveis para integrações próprias.
+
+## Host-owned production and visual review
+
+Two opt-in library modules are available to trusted hosts. They are not enabled by
+putting a tool name or a `ready: true` flag in an untrusted GraphSpec:
+
+- `@cybervinci/flow/lib/cybervinci-agent.js` exports `executeCyberVinciAgent`.
+  It starts a fresh CyberVinci CLI session with a generated primary agent,
+  deny-by-default tool permissions, prompt through stdin and verified file
+  attachments. Readonly tool classifications and file roots are host policy.
+  The result includes the strict final JSON, session ID, compact completed-tool
+  traces and usage. It does not retry or fall back after an ambiguous result.
+- `@cybervinci/flow/lib/production-loop.js` exports `runProductionQueue`.
+  A trusted host supplies prepare/produce/freeze/verifyFrozen/review callbacks.
+  Each revision runs through the actual Flow engine, with effect receipts and a
+  Fork/Join-all for the two reviewers. The producer invocation is a command
+  effect with write-ahead persistence. A known, completed technical failure may
+  return `ProductionCorrection` for another revision without fabricated scores.
+- `@cybervinci/flow-shared` exports `validateProductionReview` and its types.
+  Acceptance requires two assigned reviewers with distinct sessions/invocations,
+  matching scope/revision/manifest and evidence, ten criteria of ten points each,
+  total 100 and no outstanding findings or missing verification. A host must
+  rehash the files before review and approval; these checks do not prove semantic
+  honesty of an arbitrary model response.
+
+The queue uses an exclusive writer lock and atomic state replacement. Approval
+and cursor advancement share one state update. REVISE retains the current asset;
+WAIT or an ambiguous effect never silently advances or replays. Session budgets
+pause work without approving it. Locks are not stolen, including stale locks.
+The owner must explicitly reconcile interrupted work before resuming.
+
+CyberVinci `read` and `edit` permission aliases are indivisible: request and
+classify the full group or the bridge rejects the policy before launching. Prefer
+immutable attachments and no native tools for judges. `--pure` is retained to
+avoid recursive external plugins; it does not itself disable MCP. Arbitrary
+native-runtime overrides are not enabled by this bridge.
+
+These modules are not an OS sandbox or Blender rollback facility. Only the host
+may issue trusted receipts or write queue/approval records. Keep evidence immutable
+while the CLI reopens attachments, protect control files from producers, and
+serialize all access to the shared Blender scene. A declared vision capability
+or successful checkpoint test is not a substitute for a real image/MCP probe.
